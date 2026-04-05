@@ -1,0 +1,12 @@
+# Ignore everything by default.
+*
+
+# Keep directories visible so allowed files inside them can be tracked.
+!*/
+
+# Allow Python source and Markdown docs anywhere in the repo.
+!*.py
+!*.md
+
+# Keep this ignore file itself tracked.
+!.gitignore
