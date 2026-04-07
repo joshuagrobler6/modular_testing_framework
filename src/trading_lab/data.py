@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from pathlib import Path
 
 import pandas as pd
 
@@ -99,9 +100,77 @@ def _empty_ohlcv_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=_OHLCV_COLUMNS)
 
 
+def _coerce_timestamp_series(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        timestamps = pd.to_datetime(series, unit="s", utc=True)
+    else:
+        timestamps = pd.to_datetime(series, utc=True)
+    return pd.Series(timestamps).dt.tz_localize(None)
+
+
 def validate_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     validated = OHLCVSchema.validate(_require_dataframe("df", df).copy(), lazy=True)
     return validated.reset_index(drop=True)
+
+
+def normalize_mt5_ohlcv(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    timeframe: str,
+    timestamp_column: str = "time",
+    volume_column: str = "tick_volume",
+) -> pd.DataFrame:
+    source = _require_dataframe("df", df).copy()
+    source = source.loc[:, ~source.columns.astype(str).str.startswith("Unnamed:")]
+
+    symbol = _require_text("symbol", symbol)
+    timeframe_label, _, _ = _parse_timeframe(_require_text("timeframe", timeframe))
+
+    required_columns = [
+        timestamp_column,
+        "open",
+        "high",
+        "low",
+        "close",
+        volume_column,
+    ]
+    missing_columns = [column for column in required_columns if column not in source.columns]
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"MT5 OHLCV frame is missing required columns: {missing}.")
+
+    normalized = pd.DataFrame(
+        {
+            "ts": _coerce_timestamp_series(source[timestamp_column]),
+            "symbol": symbol,
+            "timeframe": timeframe_label,
+            "open": pd.to_numeric(source["open"], errors="raise"),
+            "high": pd.to_numeric(source["high"], errors="raise"),
+            "low": pd.to_numeric(source["low"], errors="raise"),
+            "close": pd.to_numeric(source["close"], errors="raise"),
+            "volume": pd.to_numeric(source[volume_column], errors="raise"),
+        }
+    )
+    normalized = normalized.sort_values("ts", kind="stable")
+    normalized = normalized.drop_duplicates(["ts", "symbol", "timeframe"], keep="last")
+    return validate_ohlcv(normalized[_OHLCV_COLUMNS].reset_index(drop=True))
+
+
+def load_mt5_csv(path: str | Path, *, symbol: str, timeframe: str) -> pd.DataFrame:
+    frame = pd.read_csv(Path(path))
+    return normalize_mt5_ohlcv(frame, symbol=symbol, timeframe=timeframe)
+
+
+def combine_ohlcv_frames(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:
+    validated_frames = [validate_ohlcv(_require_dataframe("frame", frame)) for frame in frames]
+    if not validated_frames:
+        return validate_ohlcv(_empty_ohlcv_frame())
+
+    combined = pd.concat(validated_frames, ignore_index=True)
+    combined = combined.sort_values(["ts", "symbol", "timeframe"], kind="stable")
+    combined = combined.drop_duplicates(["ts", "symbol", "timeframe"], keep="last")
+    return validate_ohlcv(combined[_OHLCV_COLUMNS].reset_index(drop=True))
 
 
 def split_by_symbol_timeframe(df: pd.DataFrame) -> dict[SymbolTimeframe, pd.DataFrame]:
@@ -207,9 +276,12 @@ def get_history_asof(
 
 
 __all__ = [
+    "combine_ohlcv_frames",
     "DataBundle",
     "SymbolTimeframe",
     "get_history_asof",
+    "load_mt5_csv",
+    "normalize_mt5_ohlcv",
     "resample_ohlcv",
     "split_by_symbol_timeframe",
     "validate_ohlcv",

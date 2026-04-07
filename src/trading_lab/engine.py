@@ -16,6 +16,7 @@ from trading_lab.contracts import (
     BacktestResult,
     BacktestSpec,
     Bar,
+    BarHistorySeries,
     CompatibilityAudit,
     CompatibilityError,
     CostAssumptions,
@@ -245,15 +246,15 @@ def _require_spec(spec: object) -> BacktestSpec:
     return spec
 
 
-def _build_bar(row: pd.Series) -> Bar:
+def _build_bar(row: tuple[object, ...]) -> Bar:
     return Bar(
-        timestamp=row["ts"],
-        symbol=row["symbol"],
-        open=float(row["open"]),
-        high=float(row["high"]),
-        low=float(row["low"]),
-        close=float(row["close"]),
-        volume=float(row["volume"]),
+        timestamp=row[0],
+        symbol=row[1],
+        open=float(row[3]),
+        high=float(row[4]),
+        low=float(row[5]),
+        close=float(row[6]),
+        volume=float(row[7]),
     )
 
 
@@ -1857,7 +1858,14 @@ def run_backtest(
         risk_contract=risk_contract,
     )
 
-    bars = [_build_bar(row) for _, row in validated_data.iterrows()]
+    bars = tuple(
+        _build_bar(row)
+        for row in validated_data.itertuples(index=False, name=None)
+    )
+    history_series = BarHistorySeries(
+        bars=bars,
+        contract_version=resolved_spec.contract_version,
+    )
     decision_rows: list[dict[str, object]] = []
     order_rows: list[dict[str, object]] = []
     fill_rows: list[dict[str, object]] = []
@@ -1983,7 +1991,7 @@ def run_backtest(
 
         ctx = DecisionContext(
             bar=bar,
-            history=tuple(bars[: bar_index + 1]),
+            history=history_series.window(bar_index + 1),
             instrument=resolved_spec.instrument,
             costs=resolved_spec.costs,
             position=position,

@@ -16,6 +16,8 @@ from trading_lab.contracts import (  # noqa: E402
     BacktestResult,
     BacktestSpec,
     Bar,
+    BarHistorySeries,
+    BarHistoryWindow,
     CompatibilityAudit,
     CompatibilityError,
     CostAssumptions,
@@ -73,6 +75,33 @@ def _make_context() -> DecisionContext:
         portfolio=portfolio,
         session=session,
     )
+
+
+def test_decision_context_accepts_bar_history_window() -> None:
+    bars = tuple(_make_bar(offset) for offset in range(3))
+    instrument = InstrumentMeta(
+        symbol="TEST",
+        price_increment=0.01,
+        quantity_increment=1.0,
+    )
+    costs = CostAssumptions(fee_rate=0.001, fee_per_unit=0.0, slippage_bps=5.0)
+    position = PositionState(symbol="TEST")
+    portfolio = PortfolioState(cash=10_000.0, equity=10_000.0, positions=(position,))
+    history = BarHistorySeries(bars).window(len(bars))
+
+    ctx = DecisionContext(
+        bar=bars[-1],
+        history=history,
+        instrument=instrument,
+        costs=costs,
+        position=position,
+        portfolio=portfolio,
+        session=SessionInfo(bar_index=len(bars) - 1, bars_total=len(bars)),
+    )
+
+    assert isinstance(ctx.history, BarHistoryWindow)
+    assert len(ctx.history) == 3
+    assert ctx.history[-1] == bars[-1]
 
 
 def _contract(

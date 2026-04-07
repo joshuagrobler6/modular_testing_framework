@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
+from itertools import islice
 from typing import Any, Literal, Protocol, runtime_checkable
 
 import pandas as pd
@@ -745,6 +748,107 @@ class Bar:
             raise ValueError("close must fall within [low, high].")
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class BarHistorySeries(Sequence[Bar]):
+    bars: tuple[Bar, ...]
+    symbol: str = field(init=False)
+    contract_version: str = DEFAULT_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        normalized_bars = tuple(self.bars)
+        object.__setattr__(self, "bars", normalized_bars)
+        _require_contract_version("contract_version", self.contract_version)
+        if not normalized_bars:
+            raise ValueError("bars must not be empty.")
+
+        first_symbol: str | None = None
+        for bar in normalized_bars:
+            if not isinstance(bar, Bar):
+                raise TypeError("bars must contain Bar objects only.")
+            if first_symbol is None:
+                first_symbol = bar.symbol
+            elif bar.symbol != first_symbol:
+                raise ValueError("all bars in a BarHistorySeries must share the same symbol.")
+
+        assert first_symbol is not None
+        object.__setattr__(self, "symbol", first_symbol)
+
+    def __getitem__(self, index: int | slice) -> Bar | tuple[Bar, ...]:
+        return self.bars[index]
+
+    def __iter__(self) -> Iterator[Bar]:
+        return iter(self.bars)
+
+    def __len__(self) -> int:
+        return len(self.bars)
+
+    def window(self, stop: int) -> "BarHistoryWindow":
+        return BarHistoryWindow(
+            series=self,
+            stop=stop,
+            contract_version=self.contract_version,
+        )
+
+    def index_of_timestamp(self, timestamp: datetime) -> int | None:
+        return _timestamp_index_map(self).get(timestamp)
+
+
+@dataclass(frozen=True, slots=True)
+class BarHistoryWindow(Sequence[Bar]):
+    series: BarHistorySeries
+    stop: int
+    contract_version: str = DEFAULT_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.series, BarHistorySeries):
+            raise TypeError("series must be a BarHistorySeries instance.")
+        _require_int("stop", self.stop, minimum=1)
+        _require_contract_version("contract_version", self.contract_version)
+        if self.contract_version != self.series.contract_version:
+            raise ValueError("contract_version must match series.contract_version.")
+        if self.stop > len(self.series):
+            raise ValueError("stop must not exceed the length of series.")
+
+    @property
+    def symbol(self) -> str:
+        return self.series.symbol
+
+    @property
+    def end_index(self) -> int:
+        return self.stop - 1
+
+    @property
+    def bars(self) -> tuple[Bar, ...]:
+        return self.series.bars
+
+    def __getitem__(self, index: int | slice) -> Bar | tuple[Bar, ...]:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self.stop)
+            return self.series.bars[start:stop:step]
+
+        normalized_index = index if index >= 0 else self.stop + index
+        if normalized_index < 0 or normalized_index >= self.stop:
+            raise IndexError("history index out of range.")
+        return self.series.bars[normalized_index]
+
+    def __iter__(self) -> Iterator[Bar]:
+        return islice(self.series.bars, self.stop)
+
+    def __len__(self) -> int:
+        return self.stop
+
+    def index_of_timestamp(self, timestamp: datetime) -> int | None:
+        index = self.series.index_of_timestamp(timestamp)
+        if index is None or index >= self.stop:
+            return None
+        return index
+
+
+@lru_cache(maxsize=128)
+def _timestamp_index_map(series: BarHistorySeries) -> dict[datetime, int]:
+    return {bar.timestamp: index for index, bar in enumerate(series.bars)}
+
+
 @dataclass(frozen=True, slots=True)
 class InstrumentMeta:
     symbol: str
@@ -880,7 +984,7 @@ class SessionInfo:
 @dataclass(frozen=True, slots=True)
 class DecisionContext:
     bar: Bar
-    history: tuple[Bar, ...]
+    history: Sequence[Bar]
     instrument: InstrumentMeta
     costs: CostAssumptions
     position: PositionState
@@ -893,7 +997,12 @@ class DecisionContext:
         if not isinstance(self.bar, Bar):
             raise TypeError(f"bar must be a Bar, got {type(self.bar).__name__}.")
 
-        normalized_history = tuple(self.history)
+        if isinstance(self.history, BarHistorySeries):
+            normalized_history: Sequence[Bar] = self.history.window(len(self.history))
+        elif isinstance(self.history, BarHistoryWindow):
+            normalized_history = self.history
+        else:
+            normalized_history = tuple(self.history)
         object.__setattr__(self, "history", normalized_history)
 
         if not isinstance(self.instrument, InstrumentMeta):
@@ -915,13 +1024,17 @@ class DecisionContext:
         if self.position.symbol != self.instrument.symbol:
             raise ValueError("position.symbol must match instrument.symbol.")
 
-        for history_bar in normalized_history:
-            if not isinstance(history_bar, Bar):
-                raise TypeError("history must contain Bar objects only.")
-            if history_bar.symbol != self.instrument.symbol:
+        if isinstance(normalized_history, BarHistoryWindow):
+            if normalized_history.symbol != self.instrument.symbol:
                 raise ValueError("all history bars must match instrument.symbol.")
+        else:
+            for history_bar in normalized_history:
+                if not isinstance(history_bar, Bar):
+                    raise TypeError("history must contain Bar objects only.")
+                if history_bar.symbol != self.instrument.symbol:
+                    raise ValueError("all history bars must match instrument.symbol.")
 
-        if normalized_history and normalized_history[-1] != self.bar:
+        if len(normalized_history) > 0 and normalized_history[-1] != self.bar:
             raise ValueError("history must end with the current bar.")
 
         portfolio_position = self.portfolio.get_position(self.instrument.symbol)
@@ -1133,6 +1246,8 @@ __all__ = [
     "BacktestResult",
     "BacktestSpec",
     "Bar",
+    "BarHistorySeries",
+    "BarHistoryWindow",
     "CompatibilityAudit",
     "CompatibilityError",
     "CompatibilityIssue",

@@ -10,7 +10,10 @@ from pandera.errors import SchemaError, SchemaErrors
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from trading_lab.data import (  # noqa: E402
+    combine_ohlcv_frames,
     get_history_asof,
+    load_mt5_csv,
+    normalize_mt5_ohlcv,
     resample_ohlcv,
     split_by_symbol_timeframe,
     validate_ohlcv,
@@ -87,6 +90,156 @@ def test_validate_ohlcv_rejects_missing_required_column() -> None:
 
     with pytest.raises((SchemaError, SchemaErrors)):
         validate_ohlcv(invalid)
+
+
+def test_normalize_mt5_ohlcv_converts_export_shape_to_canonical_form() -> None:
+    raw = pd.DataFrame(
+        [
+            {
+                "Unnamed: 0": 2,
+                "time": "2024-01-02 09:35:00",
+                "open": 101.0,
+                "high": 102.0,
+                "low": 100.0,
+                "close": 101.4,
+                "tick_volume": 1200,
+                "spread": 12,
+                "real_volume": 0,
+            },
+            {
+                "Unnamed: 0": 1,
+                "time": "2024-01-02 09:30:00",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.4,
+                "tick_volume": 1100,
+                "spread": 10,
+                "real_volume": 0,
+            },
+            {
+                "Unnamed: 0": 3,
+                "time": "2024-01-02 09:35:00",
+                "open": 101.1,
+                "high": 102.1,
+                "low": 100.1,
+                "close": 101.6,
+                "tick_volume": 1300,
+                "spread": 9,
+                "real_volume": 0,
+            },
+        ]
+    )
+
+    normalized = normalize_mt5_ohlcv(raw, symbol="GOLD", timeframe="5m")
+
+    assert list(normalized.columns) == [
+        "ts",
+        "symbol",
+        "timeframe",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]
+    assert list(normalized["ts"]) == [
+        pd.Timestamp("2024-01-02 09:30:00"),
+        pd.Timestamp("2024-01-02 09:35:00"),
+    ]
+    assert list(normalized["symbol"]) == ["GOLD", "GOLD"]
+    assert list(normalized["timeframe"]) == ["5m", "5m"]
+    assert normalized.iloc[-1]["close"] == pytest.approx(101.6)
+    assert normalized.iloc[-1]["volume"] == pytest.approx(1300.0)
+
+
+def test_load_mt5_csv_reads_and_normalizes_export_file(tmp_path) -> None:
+    path = tmp_path / "gold_m5_sample.csv"
+    raw = pd.DataFrame(
+        [
+            {
+                "time": "2024-01-02 09:30:00",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "tick_volume": 1000,
+                "spread": 10,
+                "real_volume": 0,
+            }
+        ]
+    )
+    raw.to_csv(path, index=False)
+
+    normalized = load_mt5_csv(path, symbol="GOLD", timeframe="5m")
+
+    assert normalized.iloc[0]["ts"] == pd.Timestamp("2024-01-02 09:30:00")
+    assert normalized.iloc[0]["symbol"] == "GOLD"
+    assert normalized.iloc[0]["timeframe"] == "5m"
+
+
+def test_combine_ohlcv_frames_merges_overlap_and_keeps_latest_observation() -> None:
+    first = validate_ohlcv(
+        pd.DataFrame(
+            [
+                {
+                    "ts": pd.Timestamp("2024-01-02 09:30:00"),
+                    "symbol": "GOLD",
+                    "timeframe": "5m",
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "volume": 1000.0,
+                },
+                {
+                    "ts": pd.Timestamp("2024-01-02 09:35:00"),
+                    "symbol": "GOLD",
+                    "timeframe": "5m",
+                    "open": 100.5,
+                    "high": 101.5,
+                    "low": 100.0,
+                    "close": 101.0,
+                    "volume": 1100.0,
+                },
+            ]
+        )
+    )
+    second = validate_ohlcv(
+        pd.DataFrame(
+            [
+                {
+                    "ts": pd.Timestamp("2024-01-02 09:35:00"),
+                    "symbol": "GOLD",
+                    "timeframe": "5m",
+                    "open": 100.6,
+                    "high": 101.8,
+                    "low": 100.1,
+                    "close": 101.2,
+                    "volume": 1150.0,
+                },
+                {
+                    "ts": pd.Timestamp("2024-01-02 09:40:00"),
+                    "symbol": "GOLD",
+                    "timeframe": "5m",
+                    "open": 101.2,
+                    "high": 102.0,
+                    "low": 100.8,
+                    "close": 101.6,
+                    "volume": 1200.0,
+                },
+            ]
+        )
+    )
+
+    combined = combine_ohlcv_frames((first, second))
+
+    assert list(combined["ts"]) == [
+        pd.Timestamp("2024-01-02 09:30:00"),
+        pd.Timestamp("2024-01-02 09:35:00"),
+        pd.Timestamp("2024-01-02 09:40:00"),
+    ]
+    assert combined.iloc[1]["close"] == pytest.approx(101.2)
 
 
 def test_split_by_symbol_timeframe_returns_grouped_bundle() -> None:

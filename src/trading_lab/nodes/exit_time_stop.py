@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from trading_lab.contracts import ActionRequest, DecisionContext, NodeContract, NodeSpec
+from trading_lab.contracts import (
+    ActionRequest,
+    BarHistoryWindow,
+    DecisionContext,
+    NodeContract,
+    NodeSpec,
+)
 from trading_lab.registry import register_exit
 
 DEFAULT_EXIT_TIME_STOP_NAME = "exit_time_stop"
@@ -11,6 +17,12 @@ DEFAULT_EXIT_TIME_STOP_NAME = "exit_time_stop"
 def _bars_in_trade(ctx: DecisionContext) -> int:
     if ctx.position.is_flat or ctx.position.entry_time is None:
         return 0
+
+    if isinstance(ctx.history, BarHistoryWindow):
+        entry_index = ctx.history.index_of_timestamp(ctx.position.entry_time)
+        if entry_index is None:
+            raise ValueError("position.entry_time was not found in ctx.history.")
+        return len(ctx.history) - entry_index
 
     for index, bar in enumerate(ctx.history):
         if bar.timestamp == ctx.position.entry_time:
