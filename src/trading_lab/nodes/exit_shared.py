@@ -1,10 +1,43 @@
 from __future__ import annotations
 
 from collections import deque
+from functools import lru_cache
 from math import sqrt
 from typing import Iterable, Sequence
 
-from trading_lab.contracts import ActionRequest, DecisionContext
+from trading_lab.contracts import (
+    ActionRequest,
+    BarHistorySeries,
+    BarHistoryWindow,
+    DecisionContext,
+)
+
+
+@lru_cache(maxsize=48)
+def _cached_price_series(
+    series: BarHistorySeries,
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...]]:
+    closes = tuple(float(bar.close) for bar in series)
+    highs = tuple(float(bar.high) for bar in series)
+    lows = tuple(float(bar.low) for bar in series)
+    return closes, highs, lows
+
+
+def full_price_series_from_ctx(
+    ctx: DecisionContext,
+) -> tuple[Sequence[float], Sequence[float], Sequence[float]]:
+    if isinstance(ctx.history, BarHistoryWindow):
+        return _cached_price_series(ctx.history.series)
+    closes = tuple(float(bar.close) for bar in ctx.history)
+    highs = tuple(float(bar.high) for bar in ctx.history)
+    lows = tuple(float(bar.low) for bar in ctx.history)
+    return closes, highs, lows
+
+
+def history_end_index(ctx: DecisionContext) -> int:
+    if isinstance(ctx.history, BarHistoryWindow):
+        return ctx.history.end_index
+    return len(ctx.history) - 1
 
 
 def closes_from_ctx(ctx: DecisionContext) -> list[float]:
@@ -63,6 +96,23 @@ def entry_price_from_ctx(ctx: DecisionContext) -> float | None:
     return None
 
 
+def entry_index_from_ctx(ctx: DecisionContext) -> int | None:
+    entry_time = getattr(ctx.position, "entry_time", None)
+    if entry_time is None:
+        return None
+
+    if isinstance(ctx.history, BarHistoryWindow):
+        entry_index = ctx.history.index_of_timestamp(entry_time)
+    else:
+        entry_index = next(
+            (index for index, bar in enumerate(ctx.history) if bar.timestamp == entry_time),
+            None,
+        )
+
+    if entry_index is None:
+        raise ValueError("position.entry_time was not found in ctx.history.")
+    return int(entry_index)
+
 
 def bars_held_from_ctx(ctx: DecisionContext) -> int | None:
     position = ctx.position
@@ -76,7 +126,11 @@ def bars_held_from_ctx(ctx: DecisionContext) -> int | None:
         value = getattr(position, attribute, None)
         if value is not None:
             return int(value)
-    return None
+
+    entry_index = entry_index_from_ctx(ctx)
+    if entry_index is None:
+        return None
+    return len(ctx.history) - entry_index
 
 
 
@@ -105,8 +159,21 @@ def action_request_exit(direction: str, reason: str) -> ActionRequest:
 def slice_since_entry(values: Sequence[float], bars_held: int) -> list[float]:
     if bars_held < 0:
         raise ValueError("bars_held must be non-negative.")
-    count = min(len(values), bars_held + 1)
+    count = min(len(values), bars_held)
     return list(values[-count:])
+
+
+def slice_between_indices(
+    values: Sequence[float],
+    *,
+    start_index: int,
+    end_index: int,
+) -> Sequence[float]:
+    if start_index < 0:
+        raise ValueError("start_index must be non-negative.")
+    if end_index < start_index:
+        raise ValueError("end_index must be >= start_index.")
+    return values[start_index : end_index + 1]
 
 
 
@@ -298,6 +365,22 @@ def atr_series(
     return rolling_mean(true_range_series(highs, lows, closes), lookback)
 
 
+@lru_cache(maxsize=64)
+def _cached_atr_series(
+    series: BarHistorySeries,
+    lookback: int,
+) -> tuple[float | None, ...]:
+    closes, highs, lows = _cached_price_series(series)
+    return tuple(atr_series(highs, lows, closes, lookback))
+
+
+def atr_series_from_ctx(ctx: DecisionContext, lookback: int) -> Sequence[float | None]:
+    if isinstance(ctx.history, BarHistoryWindow):
+        return _cached_atr_series(ctx.history.series, lookback)
+    closes, highs, lows = full_price_series_from_ctx(ctx)
+    return atr_series(highs, lows, closes, lookback)
+
+
 
 def baseline_series(values: Sequence[float], kind: str, lookback: int) -> list[float | None]:
     if kind == "ema":
@@ -363,3 +446,135 @@ def diff_series(
         difference = value - values[prior_index]
         output.append(difference / horizon if divide_by_horizon else difference)
     return output
+
+
+@lru_cache(maxsize=64)
+def _cached_macd_histogram_series(
+    series: BarHistorySeries,
+    fast_lookback: int,
+    slow_lookback: int,
+    signal_lookback: int,
+) -> tuple[tuple[float | None, ...], tuple[float | None, ...], tuple[float | None, ...]]:
+    closes, _, _ = _cached_price_series(series)
+    macd_line, signal_line, histogram = macd_histogram_series(
+        closes,
+        fast_lookback=fast_lookback,
+        slow_lookback=slow_lookback,
+        signal_lookback=signal_lookback,
+    )
+    return tuple(macd_line), tuple(signal_line), tuple(histogram)
+
+
+def macd_histogram_from_ctx(
+    ctx: DecisionContext,
+    *,
+    fast_lookback: int,
+    slow_lookback: int,
+    signal_lookback: int,
+) -> tuple[Sequence[float | None], Sequence[float | None], Sequence[float | None]]:
+    if isinstance(ctx.history, BarHistoryWindow):
+        return _cached_macd_histogram_series(
+            ctx.history.series,
+            fast_lookback,
+            slow_lookback,
+            signal_lookback,
+        )
+    closes, _, _ = full_price_series_from_ctx(ctx)
+    return macd_histogram_series(
+        closes,
+        fast_lookback=fast_lookback,
+        slow_lookback=slow_lookback,
+        signal_lookback=signal_lookback,
+    )
+
+
+@lru_cache(maxsize=48)
+def _cached_zscore_indicator_state(
+    series: BarHistorySeries,
+    baseline_kind: str,
+    baseline_lookback: int,
+    scale_kind: str,
+    scale_lookback: int,
+    gradient_horizon: int,
+    acceleration_horizon: int,
+) -> tuple[
+    tuple[float, ...],
+    tuple[float, ...],
+    tuple[float, ...],
+    tuple[float | None, ...],
+    tuple[float | None, ...],
+    tuple[float | None, ...],
+]:
+    closes, highs, lows = _cached_price_series(series)
+    baseline = baseline_series(closes, baseline_kind, baseline_lookback)
+    scale = scale_series(
+        closes=closes,
+        highs=highs,
+        lows=lows,
+        baseline=baseline,
+        scale_kind=scale_kind,
+        scale_lookback=scale_lookback,
+    )
+    z_values = zscore_series(closes, baseline, scale)
+    z_gradients = diff_series(z_values, gradient_horizon, divide_by_horizon=True)
+    z_accelerations = diff_series(
+        z_gradients,
+        acceleration_horizon,
+        divide_by_horizon=False,
+    )
+    return (
+        closes,
+        highs,
+        lows,
+        tuple(z_values),
+        tuple(z_gradients),
+        tuple(z_accelerations),
+    )
+
+
+def zscore_indicator_state_from_ctx(
+    ctx: DecisionContext,
+    *,
+    baseline_kind: str,
+    baseline_lookback: int,
+    scale_kind: str,
+    scale_lookback: int,
+    gradient_horizon: int,
+    acceleration_horizon: int,
+) -> tuple[
+    Sequence[float],
+    Sequence[float],
+    Sequence[float],
+    Sequence[float | None],
+    Sequence[float | None],
+    Sequence[float | None],
+]:
+    if isinstance(ctx.history, BarHistoryWindow):
+        return _cached_zscore_indicator_state(
+            ctx.history.series,
+            baseline_kind,
+            baseline_lookback,
+            scale_kind,
+            scale_lookback,
+            gradient_horizon,
+            acceleration_horizon,
+        )
+
+    closes, highs, lows = full_price_series_from_ctx(ctx)
+    baseline = baseline_series(closes, baseline_kind, baseline_lookback)
+    scale = scale_series(
+        closes=closes,
+        highs=highs,
+        lows=lows,
+        baseline=baseline,
+        scale_kind=scale_kind,
+        scale_lookback=scale_lookback,
+    )
+    z_values = zscore_series(closes, baseline, scale)
+    z_gradients = diff_series(z_values, gradient_horizon, divide_by_horizon=True)
+    z_accelerations = diff_series(
+        z_gradients,
+        acceleration_horizon,
+        divide_by_horizon=False,
+    )
+    return closes, highs, lows, z_values, z_gradients, z_accelerations

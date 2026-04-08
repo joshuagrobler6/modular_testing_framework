@@ -660,6 +660,7 @@ def test_search_entrypoint_accepts_serialized_config_and_emits_deep_dive(
             "backtest_fn": backtest_fn,
             "metrics_fn": _metrics_fn,
             "time_fn": FakeClock([1.0] * 3),
+            "retain_run_results": False,
         },
         verbose=False,
     )

@@ -5,12 +5,10 @@ from dataclasses import dataclass
 from trading_lab.contracts import ActionRequest, DecisionContext, NodeContract, NodeSpec
 from trading_lab.nodes.exit_shared import (
     action_request_exit,
-    atr_series,
-    closes_from_ctx,
+    atr_series_from_ctx,
     current_close,
     entry_price_from_ctx,
-    highs_from_ctx,
-    lows_from_ctx,
+    history_end_index,
     position_direction,
 )
 from trading_lab.registry import register_exit
@@ -97,10 +95,8 @@ class ProfitTargetExitNode:
             multiplier = 1.0 + self.target_percent if direction == "long" else 1.0 - self.target_percent
             return entry_price * multiplier
 
-        closes = closes_from_ctx(ctx)
-        highs = highs_from_ctx(ctx)
-        lows = lows_from_ctx(ctx)
-        atr = atr_series(highs, lows, closes, self.atr_lookback)[-1]
+        atr_values = atr_series_from_ctx(ctx, self.atr_lookback)
+        atr = atr_values[history_end_index(ctx)]
         if atr is None or atr <= 0.0:
             return None
         distance = self.atr_multiple * atr

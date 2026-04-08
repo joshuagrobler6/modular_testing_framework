@@ -5,8 +5,9 @@ import json
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
 import pandas as pd
 
@@ -86,6 +87,41 @@ _DECISION_BASE_COLUMNS = [
     "reason",
     "metadata",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedBacktestData:
+    data: pd.DataFrame
+    timeframe: str
+    bars: tuple[Bar, ...]
+    history_series: BarHistorySeries
+    symbol: str
+    contract_version: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, pd.DataFrame):
+            raise TypeError("data must be a pandas DataFrame.")
+        if not isinstance(self.timeframe, str) or not self.timeframe.strip():
+            raise ValueError("timeframe must be a non-empty string.")
+        if not isinstance(self.bars, tuple) or not self.bars:
+            raise ValueError("bars must be a non-empty tuple.")
+        if not isinstance(self.history_series, BarHistorySeries):
+            raise TypeError("history_series must be a BarHistorySeries instance.")
+        if not isinstance(self.symbol, str) or not self.symbol.strip():
+            raise ValueError("symbol must be a non-empty string.")
+        if not isinstance(self.contract_version, str) or not self.contract_version.strip():
+            raise ValueError("contract_version must be a non-empty string.")
+        if self.history_series.bars != self.bars:
+            raise ValueError("history_series must wrap the same bars tuple.")
+        if self.history_series.symbol != self.symbol:
+            raise ValueError("history_series symbol must match symbol.")
+
+    @property
+    def empty(self) -> bool:
+        return self.data.empty
+
+
+BacktestDataInput: TypeAlias = pd.DataFrame | PreparedBacktestData
 _ORDER_BASE_COLUMNS = [
     "order_id",
     "ts_submitted",
@@ -634,6 +670,49 @@ def _validate_input_frame(spec: BacktestSpec, data: pd.DataFrame) -> tuple[pd.Da
     return validated.reset_index(drop=True), timeframes[0]
 
 
+def prepare_backtest_data(
+    spec: BacktestSpec,
+    data: pd.DataFrame,
+) -> PreparedBacktestData:
+    resolved_spec = _require_spec(spec)
+    validated_data, timeframe = _validate_input_frame(resolved_spec, data)
+    bars = tuple(
+        _build_bar(row)
+        for row in validated_data.itertuples(index=False, name=None)
+    )
+    history_series = BarHistorySeries(
+        bars=bars,
+        contract_version=resolved_spec.contract_version,
+    )
+    return PreparedBacktestData(
+        data=validated_data,
+        timeframe=timeframe,
+        bars=bars,
+        history_series=history_series,
+        symbol=resolved_spec.instrument.symbol,
+        contract_version=resolved_spec.contract_version,
+    )
+
+
+def _resolve_backtest_input(
+    spec: BacktestSpec,
+    data: BacktestDataInput,
+) -> PreparedBacktestData:
+    if isinstance(data, PreparedBacktestData):
+        if data.symbol != spec.instrument.symbol:
+            raise ValueError(
+                "prepared data symbol must match spec.instrument.symbol."
+            )
+        if data.contract_version != spec.contract_version:
+            raise ValueError(
+                "prepared data contract_version must match spec.contract_version."
+            )
+        return data
+    if not isinstance(data, pd.DataFrame):
+        raise TypeError("data must be a pandas DataFrame or PreparedBacktestData.")
+    return prepare_backtest_data(spec, data)
+
+
 def _validate_outputs(
     decision_log: pd.DataFrame,
     order_log: pd.DataFrame,
@@ -748,18 +827,25 @@ def _validate_action_batch(
     capabilities: EngineCapabilities,
     contract: NodeContract,
 ) -> ActionBatch:
-    validated_requests = tuple(
+    for request in batch.requests:
         _validate_action_request(
             kind,
             request,
             capabilities=capabilities,
             contract=contract,
         )
-        for request in batch.requests
-    )
+    return batch
+
+
+@lru_cache(maxsize=8)
+def _empty_action_batch(contract_version: str) -> ActionBatch:
+    return ActionBatch(contract_version=contract_version)
+
+
+def _single_request_batch(request: ActionRequest) -> ActionBatch:
     return ActionBatch(
-        requests=validated_requests,
-        contract_version=batch.contract_version,
+        requests=(request,),
+        contract_version=request.contract_version,
     )
 
 
@@ -770,17 +856,11 @@ def _coerce_entry_output(
     contract: NodeContract,
 ) -> ActionBatch:
     if isinstance(value, EntryIntent):
-        batch = ActionBatch(
-            requests=(value.as_action_request(),),
-            contract_version=value.contract_version,
-        )
+        batch = _single_request_batch(value.as_action_request())
     elif isinstance(value, ActionBatch):
         batch = value
     elif isinstance(value, ActionRequest):
-        batch = ActionBatch(
-            requests=(value,),
-            contract_version=value.contract_version,
-        )
+        batch = _single_request_batch(value)
     else:
         raise TypeError("entry node must return EntryIntent, ActionRequest, or ActionBatch.")
     return _validate_action_batch(
@@ -798,17 +878,11 @@ def _coerce_exit_output(
     contract: NodeContract,
 ) -> ActionBatch:
     if isinstance(value, ExitIntent):
-        batch = ActionBatch(
-            requests=(value.as_action_request(),),
-            contract_version=value.contract_version,
-        )
+        batch = _single_request_batch(value.as_action_request())
     elif isinstance(value, ActionBatch):
         batch = value
     elif isinstance(value, ActionRequest):
-        batch = ActionBatch(
-            requests=(value,),
-            contract_version=value.contract_version,
-        )
+        batch = _single_request_batch(value)
     else:
         raise TypeError("exit node must return ExitIntent, ActionRequest, or ActionBatch.")
     return _validate_action_batch(
@@ -826,14 +900,11 @@ def _coerce_risk_output(
     contract: NodeContract,
 ) -> tuple[RiskDecision, ActionBatch]:
     if isinstance(value, RiskDecision):
-        return value, ActionBatch(contract_version=value.contract_version)
+        return value, _empty_action_batch(value.contract_version)
     if isinstance(value, ActionBatch):
         batch = value
     elif isinstance(value, ActionRequest):
-        batch = ActionBatch(
-            requests=(value,),
-            contract_version=value.contract_version,
-        )
+        batch = _single_request_batch(value)
     else:
         raise TypeError("risk node must return RiskDecision, ActionRequest, or ActionBatch.")
     validated_batch = _validate_action_batch(
@@ -1000,9 +1071,10 @@ def _decision_metadata(
     risk_batch: ActionBatch,
     next_bar: Bar | None,
     resolved: _ResolvedDecision,
+    capture_request_details: bool,
 ) -> dict[str, object]:
     pending_order = resolved.pending_order
-    return {
+    metadata: dict[str, object] = {
         "timeframe": timeframe,
         "bar_close": bar.close,
         "position_side": position.side,
@@ -1010,25 +1082,56 @@ def _decision_metadata(
         "exit_reason": exit_batch.primary_request.reason,
         "risk_reason": risk_decision.reason,
         "risk_action": risk_batch.primary_request.action_type if risk_batch.is_active else None,
-        "entry_requests": [
-            _serialize_request(request) for request in entry_batch.active_requests
-        ],
-        "exit_requests": [
-            _serialize_request(request) for request in exit_batch.active_requests
-        ],
-        "risk_requests": [
-            _serialize_request(request) for request in risk_batch.active_requests
-        ],
-        "accepted_requests": [
-            _serialize_request(request) for request in resolved.accepted_requests
-        ],
-        "rejected_requests": [
-            _serialize_rejected_action(rejected_action)
-            for rejected_action in resolved.rejected_actions
-        ],
         "next_bar_ts": next_bar.timestamp if next_bar is not None else None,
         "pending_order_id": pending_order.order_id if pending_order is not None else None,
     }
+    if capture_request_details:
+        metadata.update(
+            {
+                "entry_requests": [
+                    _serialize_request(request) for request in entry_batch.active_requests
+                ],
+                "exit_requests": [
+                    _serialize_request(request) for request in exit_batch.active_requests
+                ],
+                "risk_requests": [
+                    _serialize_request(request) for request in risk_batch.active_requests
+                ],
+                "accepted_requests": [
+                    _serialize_request(request) for request in resolved.accepted_requests
+                ],
+                "rejected_requests": [
+                    _serialize_rejected_action(rejected_action)
+                    for rejected_action in resolved.rejected_actions
+                ],
+            }
+        )
+    return metadata
+
+
+def _finalize_outputs(
+    *,
+    decision_rows: list[dict[str, object]],
+    order_rows: list[dict[str, object]],
+    fill_rows: list[dict[str, object]],
+    trade_rows: list[dict[str, object]],
+    equity_rows: list[dict[str, object]],
+    validate_outputs: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    decision_log = _as_dataframe(decision_rows, _DECISION_LOG_COLUMNS)
+    order_log = _as_dataframe(order_rows, _ORDER_LOG_COLUMNS)
+    fill_log = _as_dataframe(fill_rows, _FILL_LOG_COLUMNS)
+    trade_ledger = _as_dataframe(trade_rows, _TRADE_LEDGER_COLUMNS)
+    equity_curve = _as_dataframe(equity_rows, _EQUITY_CURVE_COLUMNS)
+    if validate_outputs:
+        return _validate_outputs(
+            decision_log,
+            order_log,
+            fill_log,
+            trade_ledger,
+            equity_curve,
+        )
+    return decision_log, order_log, fill_log, trade_ledger, equity_curve
 
 
 def _entry_quantity_from_requests(
@@ -1537,12 +1640,27 @@ def _position_from_open_lots(
             contract_version=spec.contract_version,
         )
 
+    first_lot = open_lots[0]
+    if len(open_lots) == 1:
+        return PositionState(
+            symbol=spec.instrument.symbol,
+            side=first_lot.side,
+            quantity=first_lot.remaining_qty,
+            entry_price=first_lot.entry_price,
+            entry_time=first_lot.entry_ts,
+            position_id=first_lot.position_id,
+            parent_position_id=first_lot.parent_position_id,
+            lot_id=first_lot.lot_id,
+            entry_tag=first_lot.entry_tag,
+            risk_tag=first_lot.risk_tag,
+            contract_version=spec.contract_version,
+        )
+
     total_qty = sum(lot.remaining_qty for lot in open_lots)
     weighted_entry = (
         sum(lot.entry_price * lot.remaining_qty for lot in open_lots) / total_qty
     )
     entry_time = min(lot.entry_ts for lot in open_lots)
-    first_lot = open_lots[0]
     lot_id = first_lot.lot_id if len(open_lots) == 1 else None
     entry_tags = {lot.entry_tag for lot in open_lots}
     risk_tags = {lot.risk_tag for lot in open_lots}
@@ -1809,12 +1927,16 @@ def _apply_fill_to_state(
 
 def run_backtest(
     spec: BacktestSpec,
-    data: pd.DataFrame,
+    data: BacktestDataInput,
     *,
     node_registry: NodeRegistry | None = None,
+    validate_outputs: bool = True,
+    capture_decision_details: bool = True,
 ) -> BacktestResult:
     resolved_spec = _require_spec(spec)
-    validated_data, timeframe = _validate_input_frame(resolved_spec, data)
+    prepared_data = _resolve_backtest_input(resolved_spec, data)
+    validated_data = prepared_data.data
+    timeframe = prepared_data.timeframe
     active_registry = node_registry or default_registry
     setup_audit = audit_backtest_setup(resolved_spec, node_registry=active_registry)
     setup_audit.raise_for_errors()
@@ -1858,14 +1980,8 @@ def run_backtest(
         risk_contract=risk_contract,
     )
 
-    bars = tuple(
-        _build_bar(row)
-        for row in validated_data.itertuples(index=False, name=None)
-    )
-    history_series = BarHistorySeries(
-        bars=bars,
-        contract_version=resolved_spec.contract_version,
-    )
+    bars = prepared_data.bars
+    history_series = prepared_data.history_series
     decision_rows: list[dict[str, object]] = []
     order_rows: list[dict[str, object]] = []
     fill_rows: list[dict[str, object]] = []
@@ -2096,6 +2212,7 @@ def run_backtest(
                     risk_batch=risk_batch,
                     next_bar=next_bar,
                     resolved=resolved,
+                    capture_request_details=capture_decision_details,
                 ),
                 **_reserved_values(
                     run_id=run_id,
@@ -2140,12 +2257,13 @@ def run_backtest(
             }
         )
 
-    decision_log, order_log, fill_log, trade_ledger, equity_curve = _validate_outputs(
-        _as_dataframe(decision_rows, _DECISION_LOG_COLUMNS),
-        _as_dataframe(order_rows, _ORDER_LOG_COLUMNS),
-        _as_dataframe(fill_rows, _FILL_LOG_COLUMNS),
-        _as_dataframe(trade_rows, _TRADE_LEDGER_COLUMNS),
-        _as_dataframe(equity_rows, _EQUITY_CURVE_COLUMNS),
+    decision_log, order_log, fill_log, trade_ledger, equity_curve = _finalize_outputs(
+        decision_rows=decision_rows,
+        order_rows=order_rows,
+        fill_rows=fill_rows,
+        trade_rows=trade_rows,
+        equity_rows=equity_rows,
+        validate_outputs=validate_outputs,
     )
 
     return BacktestResult(
@@ -2160,4 +2278,10 @@ def run_backtest(
     )
 
 
-__all__ = ["BacktestSetupAudit", "audit_backtest_setup", "run_backtest"]
+__all__ = [
+    "BacktestSetupAudit",
+    "PreparedBacktestData",
+    "audit_backtest_setup",
+    "prepare_backtest_data",
+    "run_backtest",
+]

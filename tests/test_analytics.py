@@ -387,6 +387,14 @@ def test_compute_metrics_merges_all_metric_groups_from_backtest_result() -> None
     assert metrics["costs_breakdown"]["total_costs"] == pytest.approx(36.0)
 
 
+def test_compute_metrics_can_opt_into_backtest_result_validation() -> None:
+    result = _make_result()
+    result.trade_ledger.loc[0, "side"] = "flat"
+
+    with pytest.raises((SchemaError, SchemaErrors)):
+        compute_metrics(result, validate_result=True)
+
+
 def test_metric_dependency_failures_are_clear_for_future_column_requirements() -> None:
     registry = MetricRegistry()
 

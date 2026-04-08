@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -9,6 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import trading_lab.runner as runner_module  # noqa: E402
 from trading_lab.contracts import (  # noqa: E402
     BacktestResult,
     BacktestSpec,
@@ -17,6 +20,7 @@ from trading_lab.contracts import (  # noqa: E402
     NodeContract,
     NodeSpec,
 )
+from trading_lab.engine import PreparedBacktestData  # noqa: E402
 from trading_lab.experiments import (  # noqa: E402
     ExperimentSpec,
     FoldSpec,
@@ -112,6 +116,7 @@ def _experiment(
     *,
     max_variants: int | None = None,
     max_runtime_seconds: int | None = None,
+    max_parallel_variants: int = 1,
     holdout: bool = False,
     single_fold: bool = False,
     pruning: PruningConfig | None = None,
@@ -157,8 +162,35 @@ def _experiment(
             if holdout
             else None
         ),
-        search=SearchConfig(mode="grid", **search_kwargs),
+        search=SearchConfig(
+            mode="grid",
+            max_parallel_variants=max_parallel_variants,
+            **search_kwargs,
+        ),
         pruning=pruning or PruningConfig(),
+    )
+
+
+def _parallel_backtest_fn(
+    spec: BacktestSpec,
+    data_slice: pd.DataFrame,
+    *,
+    node_registry=None,
+) -> BacktestResult:
+    label = _label_from_slice(data_slice)
+    time.sleep(0.2)
+    return BacktestResult(
+        spec=spec,
+        decision_log=pd.DataFrame(),
+        order_log=pd.DataFrame(),
+        fill_log=pd.DataFrame(),
+        trade_ledger=pd.DataFrame(),
+        equity_curve=pd.DataFrame({"equity": [100_000.0]}),
+        artifacts={
+            "run_manifest": {"run_id": f"{spec.name}-{label}"},
+            "stub_metrics": {"trade_count": 1, "net_pnl": 1.0, "gross_pnl": 1.0},
+            "worker_pid": os.getpid(),
+        },
     )
 
 
@@ -637,3 +669,187 @@ def test_prune_outcomes_are_reproducible() -> None:
     assert [record.reason for record in first.prune_records] == [
         record.reason for record in second.prune_records
     ]
+
+
+def test_parallel_variant_execution_uses_configured_batch_executor_and_preserves_order(
+    monkeypatch,
+) -> None:
+    dataset = _data()
+    variants = (
+        _variant("variant_a"),
+        _variant("variant_b"),
+        _variant("variant_c"),
+        _variant("variant_d"),
+    )
+    experiment = _experiment(
+        variants,
+        single_fold=True,
+        max_parallel_variants=2,
+    )
+
+    executor_state: dict[str, object] = {"max_workers": None, "submitted": []}
+
+    class _ImmediateFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    class _FakeProcessPoolExecutor:
+        def __init__(self, *, max_workers, initializer, initargs):
+            executor_state["max_workers"] = max_workers
+            self._initializer = initializer
+            self._initargs = initargs
+
+        def __enter__(self):
+            self._initializer(*self._initargs)
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, variant):
+            executor_state["submitted"].append(variant.variant_id)
+            return _ImmediateFuture(fn(variant))
+
+    monkeypatch.setattr(
+        runner_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        _FakeProcessPoolExecutor,
+    )
+
+    result = run_experiment(
+        experiment,
+        dataset,
+        backtest_fn=_parallel_backtest_fn,
+        metrics_fn=_metrics_fn,
+    )
+
+    assert executor_state["max_workers"] == 2
+    assert executor_state["submitted"] == [variant.variant_id for variant in variants]
+    assert result.completed_variant_ids == tuple(variant.variant_id for variant in variants)
+    assert [summary.variant_id for summary in result.cv_summaries] == [
+        variant.variant_id for variant in variants
+    ]
+
+
+def test_parallel_variant_execution_rejects_non_picklable_callbacks() -> None:
+    dataset = _data()
+    variants = (_variant("variant_a"), _variant("variant_b"))
+    experiment = _experiment(
+        variants,
+        single_fold=True,
+        max_parallel_variants=2,
+    )
+
+    def backtest_fn(
+        spec: BacktestSpec,
+        data_slice: pd.DataFrame,
+        *,
+        node_registry=None,
+    ) -> BacktestResult:
+        return _stub_result(
+            spec,
+            run_id=f"{spec.name}-{_label_from_slice(data_slice)}",
+            metrics={"trade_count": 1, "net_pnl": 1.0, "gross_pnl": 1.0},
+        )
+
+    with pytest.raises(TypeError, match="pickle-safe backtest_fn"):
+        run_experiment(
+            experiment,
+            dataset,
+            backtest_fn=backtest_fn,
+            metrics_fn=_metrics_fn,
+        )
+
+
+def test_parallel_variant_execution_falls_back_when_process_pool_is_unavailable(
+    monkeypatch,
+) -> None:
+    dataset = _data()
+    variants = (_variant("variant_a"), _variant("variant_b"))
+    experiment = _experiment(
+        variants,
+        single_fold=True,
+        max_parallel_variants=2,
+    )
+
+    class _BrokenProcessPoolExecutor:
+        def __init__(self, *args, **kwargs):
+            raise PermissionError("blocked")
+
+    monkeypatch.setattr(
+        runner_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        _BrokenProcessPoolExecutor,
+    )
+
+    result = run_experiment(
+        experiment,
+        dataset,
+        backtest_fn=_parallel_backtest_fn,
+        metrics_fn=_metrics_fn,
+    )
+
+    assert result.completed_variant_ids == tuple(variant.variant_id for variant in variants)
+    assert [summary.variant_id for summary in result.cv_summaries] == [
+        variant.variant_id for variant in variants
+    ]
+
+
+def test_run_experiment_can_drop_run_results_for_lightweight_search() -> None:
+    dataset = _data()
+    variant = _variant("variant_a")
+    experiment = _experiment((variant,), single_fold=True)
+
+    result = run_experiment(
+        experiment,
+        dataset,
+        backtest_fn=_parallel_backtest_fn,
+        metrics_fn=_metrics_fn,
+        retain_run_results=False,
+    )
+
+    assert result.run_results == {}
+    assert result.completed_variant_ids == (variant.variant_id,)
+    assert result.fold_summaries[0].variant_id == variant.variant_id
+
+
+def test_run_experiment_can_prepare_fold_inputs_once_and_reuse_them() -> None:
+    dataset = _data()
+    variants = (_variant("variant_a"), _variant("variant_b"))
+    experiment = _experiment(variants, single_fold=True)
+    prepared_calls: list[tuple[str, int]] = []
+    seen_input_types: list[str] = []
+
+    def prepared_data_fn(spec: BacktestSpec, data_slice: pd.DataFrame) -> PreparedBacktestData:
+        prepared_calls.append((spec.instrument.symbol, len(data_slice)))
+        return runner_module.prepare_backtest_data(spec, data_slice)
+
+    def backtest_fn(
+        spec: BacktestSpec,
+        data_slice,
+        *,
+        node_registry=None,
+    ) -> BacktestResult:
+        seen_input_types.append(type(data_slice).__name__)
+        assert isinstance(data_slice, PreparedBacktestData)
+        return _stub_result(
+            spec,
+            run_id=f"{spec.name}-{data_slice.timeframe}",
+            metrics={"trade_count": 1, "net_pnl": 1.0, "gross_pnl": 1.0},
+        )
+
+    result = run_experiment(
+        experiment,
+        dataset,
+        backtest_fn=backtest_fn,
+        metrics_fn=_metrics_fn,
+        prepare_backtest_inputs=True,
+        prepared_data_fn=prepared_data_fn,
+    )
+
+    assert prepared_calls == [("TEST", 1)]
+    assert seen_input_types == ["PreparedBacktestData", "PreparedBacktestData"]
+    assert result.completed_variant_ids == tuple(variant.variant_id for variant in variants)

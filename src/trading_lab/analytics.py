@@ -178,6 +178,18 @@ def _validate_backtest_result(result: BacktestResult) -> dict[LedgerName, pd.Dat
     }
 
 
+def _result_ledgers(result: BacktestResult) -> dict[LedgerName, pd.DataFrame]:
+    if not isinstance(result, BacktestResult):
+        raise TypeError("result must be a BacktestResult instance.")
+    return {
+        "decision_log": result.decision_log,
+        "order_log": result.order_log,
+        "fill_log": result.fill_log,
+        "trade_ledger": result.trade_ledger,
+        "equity_curve": result.equity_curve,
+    }
+
+
 def _validate_ledger(name: LedgerName, df: pd.DataFrame) -> pd.DataFrame:
     schema = _LEDGER_SCHEMAS[name]
     return schema.validate(df.copy(), lazy=True)
@@ -575,8 +587,12 @@ def compute_behavioral_metrics(
     return _compute_from_registry(BEHAVIORAL_METRIC_NAMES, validated_ledgers)
 
 
-def compute_metrics(result: BacktestResult) -> dict[str, Any]:
-    ledgers = _validate_backtest_result(result)
+def compute_metrics(
+    result: BacktestResult,
+    *,
+    validate_result: bool = False,
+) -> dict[str, Any]:
+    ledgers = _validate_backtest_result(result) if validate_result else _result_ledgers(result)
     metric_names = TRADE_METRIC_NAMES + EQUITY_METRIC_NAMES + BEHAVIORAL_METRIC_NAMES
     return _compute_from_registry(metric_names, ledgers)
 

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime
 from itertools import product
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args, get_origin, get_type_hints
 
 from trading_lab.contracts import (
     DEFAULT_CONTRACT_VERSION,
@@ -126,6 +126,80 @@ def _normalize_parameter_grid(
             _stable_json_value(candidate_value)
         normalized[key] = candidate_values
     return normalized
+
+
+def _coerce_field_value(field_type: object, value: object) -> object:
+    origin = get_origin(field_type)
+    if origin in (tuple, list):
+        if isinstance(value, (str, bytes)) or not isinstance(value, (tuple, list)):
+            return value
+        args = get_args(field_type)
+        item_type = args[0] if args else Any
+        normalized_items = tuple(
+            _coerce_field_value(item_type, item)
+            for item in value
+        )
+        if origin is list:
+            return list(normalized_items)
+        return normalized_items
+
+    union_args = tuple(arg for arg in get_args(field_type) if arg is not type(None))
+    if union_args and len(union_args) != len(get_args(field_type)):
+        if value is None:
+            return None
+        if len(union_args) == 1:
+            return _coerce_field_value(union_args[0], value)
+
+    if isinstance(field_type, type) and is_dataclass(field_type):
+        return _coerce_dataclass_instance(value, field_type)
+
+    return value
+
+
+def _coerce_dataclass_instance(value: object, cls: type[Any]) -> object:
+    if isinstance(value, cls):
+        return value
+
+    if isinstance(value, dict):
+        source = value
+    elif is_dataclass(value) and type(value).__name__ == cls.__name__:
+        source = {
+            field_info.name: getattr(value, field_info.name)
+            for field_info in fields(value)
+        }
+    else:
+        return value
+
+    type_hints = get_type_hints(cls)
+    payload: dict[str, object] = {}
+    for field_info in fields(cls):
+        if field_info.name not in source:
+            continue
+        payload[field_info.name] = _coerce_field_value(
+            type_hints.get(field_info.name, field_info.type),
+            source[field_info.name],
+        )
+    return cls(**payload)
+
+
+def _coerce_dataclass_config(name: str, value: object, cls: type[Any]) -> Any:
+    normalized = _coerce_dataclass_instance(value, cls)
+    if isinstance(normalized, cls):
+        return normalized
+    raise TypeError(f"{name} must be a {cls.__name__} instance.")
+
+
+def _coerce_dataclass_sequence(
+    name: str,
+    values: tuple[object, ...] | list[object],
+    cls: type[Any],
+) -> tuple[Any, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, (tuple, list)):
+        raise TypeError(f"{name} must be a tuple or list of {cls.__name__} instances.")
+    return tuple(
+        _coerce_dataclass_config(f"{name}[{index}]", value, cls)
+        for index, value in enumerate(values)
+    )
 
 
 def _stable_json_value(value: Any) -> Any:
@@ -472,6 +546,7 @@ class SearchConfig:
     mode: SearchMode
     max_variants: int | None = None
     max_runtime_seconds: int | None = None
+    max_parallel_variants: int = 1
     random_seed: int | None = None
     contract_version: str = DEFAULT_CONTRACT_VERSION
 
@@ -491,6 +566,11 @@ class SearchConfig:
                 self.max_runtime_seconds,
                 minimum=1,
             )
+        _require_int(
+            "max_parallel_variants",
+            self.max_parallel_variants,
+            minimum=1,
+        )
         if self.random_seed is not None:
             _require_int("random_seed", self.random_seed)
         _require_contract_version("contract_version", self.contract_version)
@@ -599,14 +679,34 @@ class VariantSpec:
     contract_version: str = DEFAULT_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
-        if not isinstance(self.backtest_spec, BacktestSpec):
-            raise TypeError("backtest_spec must be a BacktestSpec instance.")
-        if not isinstance(self.entry_contract, NodeContract):
-            raise TypeError("entry_contract must be a NodeContract instance.")
-        if not isinstance(self.exit_contract, NodeContract):
-            raise TypeError("exit_contract must be a NodeContract instance.")
-        if not isinstance(self.risk_contract, NodeContract):
-            raise TypeError("risk_contract must be a NodeContract instance.")
+        object.__setattr__(
+            self,
+            "backtest_spec",
+            _coerce_dataclass_config("backtest_spec", self.backtest_spec, BacktestSpec),
+        )
+        object.__setattr__(
+            self,
+            "entry_contract",
+            _coerce_dataclass_config(
+                "entry_contract",
+                self.entry_contract,
+                NodeContract,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "exit_contract",
+            _coerce_dataclass_config(
+                "exit_contract",
+                self.exit_contract,
+                NodeContract,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "risk_contract",
+            _coerce_dataclass_config("risk_contract", self.risk_contract, NodeContract),
+        )
         if self.entry_contract.kind != "entry":
             raise ValueError("entry_contract must be an entry node contract.")
         if self.exit_contract.kind != "exit":
@@ -688,15 +788,32 @@ class ExperimentSpec:
     def __post_init__(self) -> None:
         _require_non_empty("name", self.name)
         _require_contract_version("contract_version", self.contract_version)
-        if not isinstance(self.search, SearchConfig):
-            raise TypeError("search must be a SearchConfig instance.")
-        if not isinstance(self.pruning, PruningConfig):
-            raise TypeError("pruning must be a PruningConfig instance.")
-        if not isinstance(self.outputs, OutputConfig):
-            raise TypeError("outputs must be an OutputConfig instance.")
+        object.__setattr__(
+            self,
+            "search",
+            _coerce_dataclass_config("search", self.search, SearchConfig),
+        )
+        object.__setattr__(
+            self,
+            "pruning",
+            _coerce_dataclass_config("pruning", self.pruning, PruningConfig),
+        )
+        object.__setattr__(
+            self,
+            "outputs",
+            _coerce_dataclass_config("outputs", self.outputs, OutputConfig),
+        )
 
-        normalized_variants = tuple(self.variants)
-        normalized_folds = tuple(self.folds)
+        normalized_variants = _coerce_dataclass_sequence(
+            "variants",
+            self.variants,
+            VariantSpec,
+        )
+        normalized_folds = _coerce_dataclass_sequence(
+            "folds",
+            self.folds,
+            FoldSpec,
+        )
         object.__setattr__(self, "variants", normalized_variants)
         object.__setattr__(self, "folds", normalized_folds)
 
@@ -707,30 +824,32 @@ class ExperimentSpec:
 
         variant_ids: set[str] = set()
         for variant in normalized_variants:
-            if not isinstance(variant, VariantSpec):
-                raise TypeError("variants must contain VariantSpec objects only.")
             if variant.variant_id in variant_ids:
                 raise ValueError(f"duplicate variant_id {variant.variant_id!r}.")
             variant_ids.add(variant.variant_id)
 
         fold_labels: set[str] = set()
         for fold in normalized_folds:
-            if not isinstance(fold, FoldSpec):
-                raise TypeError("folds must contain FoldSpec objects only.")
             fold_name = label_fold(fold)
             if fold_name in fold_labels:
                 raise ValueError(f"duplicate fold label {fold_name!r}.")
             fold_labels.add(fold_name)
 
         if self.holdout is not None:
-            if not isinstance(self.holdout, HoldoutSpec):
-                raise TypeError("holdout must be a HoldoutSpec instance.")
+            object.__setattr__(
+                self,
+                "holdout",
+                _coerce_dataclass_config("holdout", self.holdout, HoldoutSpec),
+            )
             if self.holdout.label in fold_labels:
                 raise ValueError("holdout label must not overlap fold labels.")
 
         if self.deep_dive is not None:
-            if not isinstance(self.deep_dive, DeepDiveConfig):
-                raise TypeError("deep_dive must be a DeepDiveConfig instance.")
+            object.__setattr__(
+                self,
+                "deep_dive",
+                _coerce_dataclass_config("deep_dive", self.deep_dive, DeepDiveConfig),
+            )
             unknown_variants = sorted(
                 set(self.deep_dive.selected_variant_ids) - variant_ids
             )

@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 from trading_lab.contracts import ActionRequest, DecisionContext, NodeContract, NodeSpec
 from trading_lab.nodes.exit_shared import (
     action_request_exit,
-    atr_series,
+    atr_series_from_ctx,
     bars_held_from_ctx,
-    closes_from_ctx,
-    highs_from_ctx,
-    lows_from_ctx,
+    entry_index_from_ctx,
+    full_price_series_from_ctx,
+    history_end_index,
     position_direction,
-    slice_since_entry,
+    slice_between_indices,
 )
 from trading_lab.registry import register_exit
 
@@ -75,15 +76,26 @@ class TrailingAtrExitNode:
         if direction is None or bars_held is None or bars_held < self.activation_bars:
             return ActionRequest()
 
-        closes = closes_from_ctx(ctx)
-        highs = highs_from_ctx(ctx)
-        lows = lows_from_ctx(ctx)
-        atr = atr_series(highs, lows, closes, self.atr_lookback)[-1]
+        entry_index = entry_index_from_ctx(ctx)
+        if entry_index is None:
+            return ActionRequest()
+
+        closes, highs, lows = full_price_series_from_ctx(ctx)
+        current_index = history_end_index(ctx)
+        atr = atr_series_from_ctx(ctx, self.atr_lookback)[current_index]
         if atr is None or atr <= 0.0:
             return ActionRequest()
 
-        trail_stop = self._trail_stop(direction, closes, highs, lows, bars_held, atr)
-        close = closes[-1]
+        trail_stop = self._trail_stop(
+            direction,
+            closes,
+            highs,
+            lows,
+            entry_index=entry_index,
+            current_index=current_index,
+            atr=atr,
+        )
+        close = closes[current_index]
         crossed = close <= trail_stop if direction == "long" else close >= trail_stop
         if not crossed:
             return ActionRequest()
@@ -99,19 +111,33 @@ class TrailingAtrExitNode:
     def _trail_stop(
         self,
         direction: str,
-        closes: list[float],
-        highs: list[float],
-        lows: list[float],
-        bars_held: int,
+        closes: Sequence[float],
+        highs: Sequence[float],
+        lows: Sequence[float],
+        *,
+        entry_index: int,
+        current_index: int,
         atr: float,
     ) -> float:
         if direction == "long":
             reference_series = highs if self.reference_kind == "highest_high" else closes
-            reference = max(slice_since_entry(reference_series, bars_held))
+            reference = max(
+                slice_between_indices(
+                    reference_series,
+                    start_index=entry_index,
+                    end_index=current_index,
+                )
+            )
             return reference - self.atr_multiple * atr
 
         reference_series = lows if self.reference_kind == "lowest_low" else closes
-        reference = min(slice_since_entry(reference_series, bars_held))
+        reference = min(
+            slice_between_indices(
+                reference_series,
+                start_index=entry_index,
+                end_index=current_index,
+            )
+        )
         return reference + self.atr_multiple * atr
 
 

@@ -6,12 +6,12 @@ from trading_lab.contracts import ActionRequest, DecisionContext, NodeContract, 
 from trading_lab.nodes.exit_shared import (
     action_request_exit,
     bars_held_from_ctx,
-    closes_from_ctx,
+    entry_index_from_ctx,
     entry_price_from_ctx,
-    highs_from_ctx,
-    lows_from_ctx,
+    full_price_series_from_ctx,
+    history_end_index,
     position_direction,
-    slice_since_entry,
+    slice_between_indices,
 )
 from trading_lab.registry import register_exit
 
@@ -76,16 +76,31 @@ class MfeGivebackExitNode:
         if direction is None or bars_held is None or entry_price is None:
             return ActionRequest()
 
-        closes = closes_from_ctx(ctx)
-        highs = highs_from_ctx(ctx)
-        lows = lows_from_ctx(ctx)
-        current_close_price = closes[-1]
+        entry_index = entry_index_from_ctx(ctx)
+        if entry_index is None:
+            return ActionRequest()
+
+        closes, highs, lows = full_price_series_from_ctx(ctx)
+        current_index = history_end_index(ctx)
+        current_close_price = closes[current_index]
         if direction == "long":
-            mfe_price = max(slice_since_entry(highs, bars_held))
+            mfe_price = max(
+                slice_between_indices(
+                    highs,
+                    start_index=entry_index,
+                    end_index=current_index,
+                )
+            )
             current_profit = current_close_price - entry_price
             peak_profit = mfe_price - entry_price
         else:
-            mfe_price = min(slice_since_entry(lows, bars_held))
+            mfe_price = min(
+                slice_between_indices(
+                    lows,
+                    start_index=entry_index,
+                    end_index=current_index,
+                )
+            )
             current_profit = entry_price - current_close_price
             peak_profit = entry_price - mfe_price
 

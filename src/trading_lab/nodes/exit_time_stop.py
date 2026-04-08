@@ -4,31 +4,14 @@ from dataclasses import dataclass
 
 from trading_lab.contracts import (
     ActionRequest,
-    BarHistoryWindow,
     DecisionContext,
     NodeContract,
     NodeSpec,
 )
+from trading_lab.nodes.exit_shared import bars_held_from_ctx
 from trading_lab.registry import register_exit
 
 DEFAULT_EXIT_TIME_STOP_NAME = "exit_time_stop"
-
-
-def _bars_in_trade(ctx: DecisionContext) -> int:
-    if ctx.position.is_flat or ctx.position.entry_time is None:
-        return 0
-
-    if isinstance(ctx.history, BarHistoryWindow):
-        entry_index = ctx.history.index_of_timestamp(ctx.position.entry_time)
-        if entry_index is None:
-            raise ValueError("position.entry_time was not found in ctx.history.")
-        return len(ctx.history) - entry_index
-
-    for index, bar in enumerate(ctx.history):
-        if bar.timestamp == ctx.position.entry_time:
-            return len(ctx.history) - index
-
-    raise ValueError("position.entry_time was not found in ctx.history.")
 
 
 def build_exit_time_stop_contract(
@@ -68,7 +51,9 @@ class TimeStopExitNode:
         if ctx.position.is_flat:
             return ActionRequest()
 
-        bars_in_trade = _bars_in_trade(ctx)
+        bars_in_trade = bars_held_from_ctx(ctx)
+        if bars_in_trade is None:
+            raise ValueError("time stop exit requires position entry timing in ctx.history.")
         if bars_in_trade >= self.hold_bars:
             return ActionRequest(
                 action_type="close",

@@ -9,9 +9,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 def _load_zscore_script() -> dict[str, object]:
     repo_root = Path(__file__).resolve().parents[1]
-    for module_name in list(sys.modules):
-        if module_name == "trading_lab" or module_name.startswith("trading_lab."):
-            sys.modules.pop(module_name, None)
     script_path = repo_root / "src" / "Experiments" / "z_score.py"
     return runpy.run_path(str(script_path), run_name="zscore_test")
 
@@ -49,7 +46,7 @@ def test_zscore_experiment_builds_variants_and_runs_search(tmp_path) -> None:
     result = run_search_entrypoint(
         run_config,
         data,
-        runner_kwargs={"node_registry": registry},
+        runner_kwargs=namespace["build_search_runner_kwargs"](registry),
         output_dir=tmp_path,
         write_manifest=False,
         verbose=False,
@@ -79,3 +76,21 @@ def test_zscore_experiment_respects_runtime_env_override(monkeypatch) -> None:
     assert registry.resolve("entry", entry_contracts[0].name) is not None
     assert registry.resolve("exit", exit_contracts[0].name) is not None
     assert run_config.experiment.search.max_runtime_seconds == 1800
+
+
+def test_zscore_experiment_respects_parallel_env_override(monkeypatch) -> None:
+    namespace = _load_zscore_script()
+    monkeypatch.setenv("Z_SCORE_MAX_PARALLEL_VARIANTS", "3")
+
+    data = namespace["build_demo_data"]()
+    registry, entry_contracts, exit_contracts, risk_contract = namespace["build_components"]()
+    run_config = namespace["build_run_config"](
+        data,
+        entry_contracts[:1],
+        exit_contracts[:1],
+        risk_contract,
+    )
+
+    assert registry.resolve("entry", entry_contracts[0].name) is not None
+    assert registry.resolve("exit", exit_contracts[0].name) is not None
+    assert run_config.experiment.search.max_parallel_variants == 3

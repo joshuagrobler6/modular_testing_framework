@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import Sequence
 
-from trading_lab.contracts import ActionRequest, DecisionContext, NodeContract, NodeSpec
+from trading_lab.contracts import (
+    ActionRequest,
+    Bar,
+    BarHistorySeries,
+    BarHistoryWindow,
+    DecisionContext,
+    NodeContract,
+    NodeSpec,
+)
 from trading_lab.nodes.exit_shared import (
     action_request_exit,
     baseline_series,
-    closes_from_ctx,
     diff_series,
-    highs_from_ctx,
-    lows_from_ctx,
     position_direction,
     scale_series,
     zscore_series,
@@ -119,59 +126,226 @@ class ZScoreReleaseExitNode:
         if direction is None:
             return ActionRequest()
 
-        closes = closes_from_ctx(ctx)
-        highs = highs_from_ctx(ctx)
-        lows = lows_from_ctx(ctx)
-        baseline = baseline_series(closes, self.baseline_kind, self.baseline_lookback)
-        scale = scale_series(
-            closes=closes,
-            highs=highs,
-            lows=lows,
-            baseline=baseline,
+        if isinstance(ctx.history, BarHistoryWindow):
+            long_plan, short_plan = _cached_release_plans(
+                ctx.history.series,
+                self.baseline_kind,
+                self.baseline_lookback,
+                self.scale_kind,
+                self.scale_lookback,
+                self.release_kind,
+                self.z_exit_threshold,
+                self.gradient_horizon,
+                self.gradient_threshold,
+                self.acceleration_horizon,
+                self.acceleration_threshold,
+                self.confirm_bars,
+            )
+            plan = long_plan if direction == "long" else short_plan
+            return plan[ctx.history.end_index]
+
+        long_plan, short_plan = _compute_release_plans(
+            tuple(ctx.history),
+            baseline_kind=self.baseline_kind,
+            baseline_lookback=self.baseline_lookback,
             scale_kind=self.scale_kind,
             scale_lookback=self.scale_lookback,
+            release_kind=self.release_kind,
+            z_exit_threshold=self.z_exit_threshold,
+            gradient_horizon=self.gradient_horizon,
+            gradient_threshold=self.gradient_threshold,
+            acceleration_horizon=self.acceleration_horizon,
+            acceleration_threshold=self.acceleration_threshold,
+            confirm_bars=self.confirm_bars,
         )
-        z_series = zscore_series(closes, baseline, scale)
-        gradient_series = diff_series(z_series, self.gradient_horizon, divide_by_horizon=True)
-        acceleration_series = diff_series(
-            gradient_series,
-            self.acceleration_horizon,
-            divide_by_horizon=False,
-        )
-        if not self._should_exit(direction, z_series, gradient_series, acceleration_series):
-            return ActionRequest()
+        plan = long_plan if direction == "long" else short_plan
+        return plan[-1] if plan else ActionRequest()
 
-        return action_request_exit(
-            direction,
-            (
-                f"zscore_release release_kind={self.release_kind} "
-                f"z={z_series[-1]} dz={gradient_series[-1]} ddz={acceleration_series[-1]}"
-            ),
-        )
 
-    def _should_exit(
-        self,
-        direction: str,
-        z_series: list[float | None],
-        gradient_series: list[float | None],
-        acceleration_series: list[float | None],
-    ) -> bool:
-        if self.release_kind == "threshold_cross":
-            recent = z_series[-self.confirm_bars:]
+@lru_cache(maxsize=48)
+def _cached_release_plans(
+    series: BarHistorySeries,
+    baseline_kind: str,
+    baseline_lookback: int,
+    scale_kind: str,
+    scale_lookback: int,
+    release_kind: str,
+    z_exit_threshold: float,
+    gradient_horizon: int,
+    gradient_threshold: float,
+    acceleration_horizon: int,
+    acceleration_threshold: float,
+    confirm_bars: int,
+) -> tuple[tuple[ActionRequest, ...], tuple[ActionRequest, ...]]:
+    return _compute_release_plans(
+        series.bars,
+        baseline_kind=baseline_kind,
+        baseline_lookback=baseline_lookback,
+        scale_kind=scale_kind,
+        scale_lookback=scale_lookback,
+        release_kind=release_kind,
+        z_exit_threshold=z_exit_threshold,
+        gradient_horizon=gradient_horizon,
+        gradient_threshold=gradient_threshold,
+        acceleration_horizon=acceleration_horizon,
+        acceleration_threshold=acceleration_threshold,
+        confirm_bars=confirm_bars,
+    )
+
+
+def _compute_release_plans(
+    bars: Sequence[Bar],
+    *,
+    baseline_kind: str,
+    baseline_lookback: int,
+    scale_kind: str,
+    scale_lookback: int,
+    release_kind: str,
+    z_exit_threshold: float,
+    gradient_horizon: int,
+    gradient_threshold: float,
+    acceleration_horizon: int,
+    acceleration_threshold: float,
+    confirm_bars: int,
+) -> tuple[tuple[ActionRequest, ...], tuple[ActionRequest, ...]]:
+    if not bars:
+        return (), ()
+
+    closes = tuple(float(bar.close) for bar in bars)
+    highs = tuple(float(bar.high) for bar in bars)
+    lows = tuple(float(bar.low) for bar in bars)
+    baseline = baseline_series(closes, baseline_kind, baseline_lookback)
+    scale = scale_series(
+        closes=closes,
+        highs=highs,
+        lows=lows,
+        baseline=baseline,
+        scale_kind=scale_kind,
+        scale_lookback=scale_lookback,
+    )
+    z_series = zscore_series(closes, baseline, scale)
+    gradient_series = diff_series(z_series, gradient_horizon, divide_by_horizon=True)
+    acceleration_series = diff_series(
+        gradient_series,
+        acceleration_horizon,
+        divide_by_horizon=False,
+    )
+
+    long_actions: list[ActionRequest] = []
+    short_actions: list[ActionRequest] = []
+    for index in range(len(closes)):
+        long_actions.append(
+            _release_action_at(
+                "long",
+                index=index,
+                release_kind=release_kind,
+                z_exit_threshold=z_exit_threshold,
+                gradient_threshold=gradient_threshold,
+                acceleration_threshold=acceleration_threshold,
+                confirm_bars=confirm_bars,
+                z_series=z_series,
+                gradient_series=gradient_series,
+                acceleration_series=acceleration_series,
+            )
+        )
+        short_actions.append(
+            _release_action_at(
+                "short",
+                index=index,
+                release_kind=release_kind,
+                z_exit_threshold=z_exit_threshold,
+                gradient_threshold=gradient_threshold,
+                acceleration_threshold=acceleration_threshold,
+                confirm_bars=confirm_bars,
+                z_series=z_series,
+                gradient_series=gradient_series,
+                acceleration_series=acceleration_series,
+            )
+        )
+    return tuple(long_actions), tuple(short_actions)
+
+
+def _release_action_at(
+    direction: str,
+    *,
+    index: int,
+    release_kind: str,
+    z_exit_threshold: float,
+    gradient_threshold: float,
+    acceleration_threshold: float,
+    confirm_bars: int,
+    z_series: Sequence[float | None],
+    gradient_series: Sequence[float | None],
+    acceleration_series: Sequence[float | None],
+) -> ActionRequest:
+    if not _should_exit_at(
+        direction,
+        index=index,
+        release_kind=release_kind,
+        z_exit_threshold=z_exit_threshold,
+        gradient_threshold=gradient_threshold,
+        acceleration_threshold=acceleration_threshold,
+        confirm_bars=confirm_bars,
+        z_series=z_series,
+        gradient_series=gradient_series,
+        acceleration_series=acceleration_series,
+    ):
+        return ActionRequest()
+
+    return action_request_exit(
+        direction,
+        (
+            f"zscore_release release_kind={release_kind} "
+            f"z={z_series[index]} dz={gradient_series[index]} ddz={acceleration_series[index]}"
+        ),
+    )
+
+
+def _should_exit_at(
+    direction: str,
+    *,
+    index: int,
+    release_kind: str,
+    z_exit_threshold: float,
+    gradient_threshold: float,
+    acceleration_threshold: float,
+    confirm_bars: int,
+    z_series: Sequence[float | None],
+    gradient_series: Sequence[float | None],
+    acceleration_series: Sequence[float | None],
+) -> bool:
+    start = index - confirm_bars + 1
+    if start < 0:
+        return False
+
+    if release_kind == "threshold_cross":
+        for offset in range(start, index + 1):
+            value = z_series[offset]
             if direction == "long":
-                return all(value is not None and value <= self.z_exit_threshold for value in recent)
-            return all(value is not None and value >= -self.z_exit_threshold for value in recent)
+                if value is None or value > z_exit_threshold:
+                    return False
+            elif value is None or value < -z_exit_threshold:
+                return False
+        return True
 
-        if self.release_kind == "gradient_flip":
-            recent = gradient_series[-self.confirm_bars:]
+    if release_kind == "gradient_flip":
+        for offset in range(start, index + 1):
+            value = gradient_series[offset]
             if direction == "long":
-                return all(value is not None and value <= -self.gradient_threshold for value in recent)
-            return all(value is not None and value >= self.gradient_threshold for value in recent)
+                if value is None or value > -gradient_threshold:
+                    return False
+            elif value is None or value < gradient_threshold:
+                return False
+        return True
 
-        recent = acceleration_series[-self.confirm_bars:]
+    for offset in range(start, index + 1):
+        value = acceleration_series[offset]
         if direction == "long":
-            return all(value is not None and value <= -self.acceleration_threshold for value in recent)
-        return all(value is not None and value >= self.acceleration_threshold for value in recent)
+            if value is None or value > -acceleration_threshold:
+                return False
+        elif value is None or value < acceleration_threshold:
+            return False
+    return True
 
 
 

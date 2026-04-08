@@ -46,8 +46,13 @@ from trading_lab.data import (
     split_by_symbol_timeframe,
     validate_ohlcv,
 )
-from trading_lab.engine import run_backtest
-from trading_lab.engine import BacktestSetupAudit, audit_backtest_setup
+from trading_lab.engine import (
+    BacktestSetupAudit,
+    PreparedBacktestData,
+    audit_backtest_setup,
+    prepare_backtest_data,
+    run_backtest,
+)
 from trading_lab.experiments import (
     DeepDiveConfig,
     ExperimentSpec,
@@ -158,6 +163,7 @@ __all__ = [
     "OrderLogSchema",
     "OutputConfig",
     "PACKAGE_VERSION",
+    "PreparedBacktestData",
     "PortfolioState",
     "PositionState",
     "PruningConfig",
@@ -189,6 +195,7 @@ __all__ = [
     "register_exit",
     "register_risk",
     "registry",
+    "prepare_backtest_data",
     "resample_ohlcv",
     "resolve",
     "resolve_entry",

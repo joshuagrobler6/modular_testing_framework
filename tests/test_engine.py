@@ -8,6 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import trading_lab.engine as engine_module  # noqa: E402
 from trading_lab.contracts import (  # noqa: E402
     ActionBatch,
     ActionRequest,
@@ -26,10 +27,14 @@ from trading_lab.contracts import (  # noqa: E402
     RiskDecision,
     SetupCompatibilityError,
 )
-from trading_lab.engine import audit_backtest_setup, run_backtest  # noqa: E402
+from trading_lab.engine import audit_backtest_setup, prepare_backtest_data, run_backtest  # noqa: E402
 from trading_lab.nodes.entry_sma_cross import (  # noqa: E402
     SMACrossEntryNode,
     build_entry_sma_cross_contract,
+)
+from trading_lab.nodes.exit_no_progress import (  # noqa: E402
+    NoProgressExitNode,
+    build_exit_no_progress_contract,
 )
 from trading_lab.nodes.exit_time_stop import (  # noqa: E402
     TimeStopExitNode,
@@ -187,6 +192,222 @@ def test_next_bar_open_execution_timing_and_trade_ledger_for_long() -> None:
     assert trade["net_pnl"] == pytest.approx(2.0)
     assert trade["bars_held"] == 2
     assert trade["exit_reason"] == "time-exit"
+
+
+def test_no_progress_exit_uses_position_entry_time_to_close_trade() -> None:
+    registry = NodeRegistry()
+
+    @registry.entry(
+        "entry_long_once",
+        contract=_contract("entry_long_once", "entry", ("enter_long", "hold")),
+    )
+    def entry_long_once(ctx: DecisionContext) -> ActionRequest:
+        if ctx.session.bar_index == 0 and ctx.position.is_flat:
+            return ActionRequest(action_type="enter_long", units=1.0, reason="open")
+        return ActionRequest(action_type="hold")
+
+    registry.register(
+        "exit",
+        "exit_no_progress_test",
+        NoProgressExitNode(evaluation_bars=2, min_open_profit_points=0.0),
+        build_exit_no_progress_contract(
+            name="exit_no_progress_test",
+            evaluation_bars=2,
+            min_open_profit_points=0.0,
+        ),
+    )
+
+    @registry.risk(
+        "risk_one_unit",
+        contract=_contract("risk_one_unit", "risk", ("hold",)),
+    )
+    def risk_one_unit(
+        ctx: DecisionContext,
+        entry_intent: ActionBatch,
+        exit_intent: ActionBatch,
+    ) -> RiskDecision:
+        if entry_intent.is_active:
+            return RiskDecision(
+                allow_entry=True,
+                entry_quantity=1.0,
+                reason="one-unit",
+            )
+        return RiskDecision()
+
+    result = run_backtest(
+        _make_spec("entry_long_once", "exit_no_progress_test", "risk_one_unit"),
+        _make_ohlcv([100.0, 100.0, 99.0, 98.0, 97.0]),
+        node_registry=registry,
+    )
+
+    assert len(result.trade_ledger) == 1
+    trade = result.trade_ledger.iloc[0]
+    assert trade["entry_ts"] == pd.Timestamp("2024-01-02 09:32:00")
+    assert trade["exit_ts"] == pd.Timestamp("2024-01-02 09:34:00")
+    assert trade["bars_held"] == 2
+    assert "no_progress" in trade["exit_reason"]
+
+
+def test_run_backtest_can_skip_output_validation(monkeypatch) -> None:
+    registry = NodeRegistry()
+
+    @registry.entry(
+        "entry_long_once",
+        contract=_contract("entry_long_once", "entry", ("enter_long", "hold")),
+    )
+    def entry_long_once(ctx: DecisionContext) -> ActionRequest:
+        if ctx.session.bar_index == 0 and ctx.position.is_flat:
+            return ActionRequest(action_type="enter_long", units=1.0, reason="open")
+        return ActionRequest()
+
+    @registry.exit(
+        "exit_after_one_bar",
+        contract=_contract("exit_after_one_bar", "exit", ("close", "hold")),
+    )
+    def exit_after_one_bar(ctx: DecisionContext) -> ActionRequest:
+        if ctx.session.bar_index == 1 and ctx.position.is_long:
+            return ActionRequest(action_type="close", reason="time-exit")
+        return ActionRequest()
+
+    @registry.risk(
+        "risk_one_unit",
+        contract=_contract("risk_one_unit", "risk", ("hold",)),
+    )
+    def risk_one_unit(
+        ctx: DecisionContext,
+        entry_intent: ActionBatch,
+        exit_intent: ActionBatch,
+    ) -> RiskDecision:
+        if entry_intent.is_active:
+            return RiskDecision(
+                allow_entry=True,
+                entry_quantity=1.0,
+                reason="one-unit",
+            )
+        return RiskDecision()
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("_validate_outputs should be skipped when validate_outputs=False")
+
+    monkeypatch.setattr(engine_module, "_validate_outputs", fail_if_called)
+
+    result = run_backtest(
+        _make_spec("entry_long_once", "exit_after_one_bar", "risk_one_unit"),
+        _make_ohlcv([100.0, 101.0, 102.0]),
+        node_registry=registry,
+        validate_outputs=False,
+    )
+
+    assert len(result.trade_ledger) == 1
+    assert list(result.decision_log["resolved_action"]) == [
+        "submit_entry_long",
+        "submit_exit",
+        "hold",
+    ]
+
+
+def test_run_backtest_can_disable_heavy_decision_request_details() -> None:
+    registry = NodeRegistry()
+
+    @registry.entry(
+        "entry_long_once",
+        contract=_contract("entry_long_once", "entry", ("enter_long", "hold")),
+    )
+    def entry_long_once(ctx: DecisionContext) -> ActionRequest:
+        if ctx.session.bar_index == 0 and ctx.position.is_flat:
+            return ActionRequest(action_type="enter_long", units=1.0, reason="open")
+        return ActionRequest()
+
+    @registry.exit(
+        "exit_after_one_bar",
+        contract=_contract("exit_after_one_bar", "exit", ("close", "hold")),
+    )
+    def exit_after_one_bar(ctx: DecisionContext) -> ActionRequest:
+        if ctx.session.bar_index == 1 and ctx.position.is_long:
+            return ActionRequest(action_type="close", reason="time-exit")
+        return ActionRequest()
+
+    @registry.risk(
+        "risk_one_unit",
+        contract=_contract("risk_one_unit", "risk", ("hold",)),
+    )
+    def risk_one_unit(
+        ctx: DecisionContext,
+        entry_intent: ActionBatch,
+        exit_intent: ActionBatch,
+    ) -> RiskDecision:
+        if entry_intent.is_active:
+            return RiskDecision(
+                allow_entry=True,
+                entry_quantity=1.0,
+                reason="one-unit",
+            )
+        return RiskDecision()
+
+    result = run_backtest(
+        _make_spec("entry_long_once", "exit_after_one_bar", "risk_one_unit"),
+        _make_ohlcv([100.0, 101.0, 102.0]),
+        node_registry=registry,
+        capture_decision_details=False,
+    )
+
+    first_metadata = result.decision_log.iloc[0]["metadata"]
+    assert first_metadata["timeframe"] == "1m"
+    assert first_metadata["entry_reason"] == "open"
+    assert "entry_requests" not in first_metadata
+    assert "rejected_requests" not in first_metadata
+
+
+def test_run_backtest_accepts_prepared_backtest_data() -> None:
+    registry = NodeRegistry()
+
+    @registry.entry(
+        "entry_long_once",
+        contract=_contract("entry_long_once", "entry", ("enter_long", "hold")),
+    )
+    def entry_long_once(ctx: DecisionContext) -> ActionRequest:
+        if ctx.session.bar_index == 0 and ctx.position.is_flat:
+            return ActionRequest(action_type="enter_long", units=1.0, reason="open")
+        return ActionRequest()
+
+    @registry.exit(
+        "exit_after_one_bar",
+        contract=_contract("exit_after_one_bar", "exit", ("close", "hold")),
+    )
+    def exit_after_one_bar(ctx: DecisionContext) -> ActionRequest:
+        if ctx.session.bar_index == 1 and ctx.position.is_long:
+            return ActionRequest(action_type="close", reason="time-exit")
+        return ActionRequest()
+
+    @registry.risk(
+        "risk_one_unit",
+        contract=_contract("risk_one_unit", "risk", ("hold",)),
+    )
+    def risk_one_unit(
+        ctx: DecisionContext,
+        entry_intent: ActionBatch,
+        exit_intent: ActionBatch,
+    ) -> RiskDecision:
+        if entry_intent.is_active:
+            return RiskDecision(
+                allow_entry=True,
+                entry_quantity=1.0,
+                reason="one-unit",
+            )
+        return RiskDecision()
+
+    dataset = _make_ohlcv([100.0, 101.0, 102.0])
+    spec = _make_spec("entry_long_once", "exit_after_one_bar", "risk_one_unit")
+    prepared = prepare_backtest_data(spec, dataset)
+
+    raw_result = run_backtest(spec, dataset, node_registry=registry)
+    prepared_result = run_backtest(spec, prepared, node_registry=registry)
+
+    pd.testing.assert_frame_equal(raw_result.decision_log, prepared_result.decision_log)
+    pd.testing.assert_frame_equal(raw_result.order_log, prepared_result.order_log)
+    pd.testing.assert_frame_equal(raw_result.fill_log, prepared_result.fill_log)
+    pd.testing.assert_frame_equal(raw_result.trade_ledger, prepared_result.trade_ledger)
+    pd.testing.assert_frame_equal(raw_result.equity_curve, prepared_result.equity_curve)
 
 
 def test_run_manifest_and_run_id_are_stamped_for_reproducibility() -> None:

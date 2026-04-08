@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from trading_lab.contracts import ActionRequest, DecisionContext, NodeContract, NodeSpec
 from trading_lab.nodes.exit_shared import (
     action_request_exit,
-    closes_from_ctx,
-    macd_histogram_series,
+    history_end_index,
+    macd_histogram_from_ctx,
     position_direction,
 )
 from trading_lab.registry import register_exit
@@ -76,14 +76,19 @@ class MacdReleaseExitNode:
         if direction is None:
             return ActionRequest()
 
-        closes = closes_from_ctx(ctx)
-        macd_line, signal_line, histogram = macd_histogram_series(
-            closes,
+        macd_line, signal_line, histogram = macd_histogram_from_ctx(
+            ctx,
             fast_lookback=self.fast_lookback,
             slow_lookback=self.slow_lookback,
             signal_lookback=self.signal_lookback,
         )
-        if not self._should_exit(direction, macd_line, signal_line, histogram):
+        if not self._should_exit(
+            direction,
+            macd_line,
+            signal_line,
+            histogram,
+            index=history_end_index(ctx),
+        ):
             return ActionRequest()
 
         return action_request_exit(
@@ -97,12 +102,18 @@ class MacdReleaseExitNode:
     def _should_exit(
         self,
         direction: str,
-        macd_line: list[float | None],
-        signal_line: list[float | None],
-        histogram: list[float | None],
+        macd_line,
+        signal_line,
+        histogram,
+        *,
+        index: int,
     ) -> bool:
+        start = index - self.confirm_bars + 1
+        if start < 0:
+            return False
+
         if self.release_kind == "histogram_cross":
-            recent = histogram[-self.confirm_bars:]
+            recent = histogram[start : index + 1]
             if len(recent) < self.confirm_bars:
                 return False
             if direction == "long":
@@ -111,16 +122,16 @@ class MacdReleaseExitNode:
 
         if self.release_kind == "histogram_slope":
             slopes = []
-            for index in range(len(histogram) - self.confirm_bars, len(histogram)):
-                if index <= 0 or histogram[index] is None or histogram[index - 1] is None:
+            for offset in range(start, index + 1):
+                if offset <= 0 or histogram[offset] is None or histogram[offset - 1] is None:
                     return False
-                slopes.append(histogram[index] - histogram[index - 1])
+                slopes.append(histogram[offset] - histogram[offset - 1])
             if direction == "long":
                 return all(value < 0.0 for value in slopes)
             return all(value > 0.0 for value in slopes)
 
-        recent_macd = macd_line[-self.confirm_bars:]
-        recent_signal = signal_line[-self.confirm_bars:]
+        recent_macd = macd_line[start : index + 1]
+        recent_signal = signal_line[start : index + 1]
         if len(recent_macd) < self.confirm_bars or len(recent_signal) < self.confirm_bars:
             return False
         comparisons = [

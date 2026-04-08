@@ -358,6 +358,12 @@ class ActionRequest:
 class ActionBatch:
     requests: tuple[ActionRequest, ...] = ()
     contract_version: str = DEFAULT_CONTRACT_VERSION
+    _active_requests: tuple[ActionRequest, ...] = field(
+        init=False,
+        repr=False,
+        default=(),
+    )
+    _primary_request: ActionRequest = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         _require_contract_version("contract_version", self.contract_version)
@@ -369,26 +375,34 @@ class ActionBatch:
                 raise ValueError(
                     "all requests in an ActionBatch must share the batch contract_version."
                 )
+        active_requests = tuple(
+            request for request in normalized_requests if request.is_active
+        )
         object.__setattr__(self, "requests", normalized_requests)
+        object.__setattr__(self, "_active_requests", active_requests)
+        object.__setattr__(
+            self,
+            "_primary_request",
+            active_requests[0]
+            if active_requests
+            else ActionRequest(contract_version=self.contract_version),
+        )
 
     @property
     def active_requests(self) -> tuple[ActionRequest, ...]:
-        return tuple(request for request in self.requests if request.is_active)
+        return self._active_requests
 
     @property
     def is_active(self) -> bool:
-        return bool(self.active_requests)
+        return bool(self._active_requests)
 
     @property
     def primary_request(self) -> ActionRequest:
-        active_requests = self.active_requests
-        if active_requests:
-            return active_requests[0]
-        return ActionRequest(contract_version=self.contract_version)
+        return self._primary_request
 
     @property
     def action_types(self) -> tuple[ActionType, ...]:
-        return tuple(request.action_type for request in self.active_requests)
+        return tuple(request.action_type for request in self._active_requests)
 
     @property
     def action_type(self) -> ActionType:

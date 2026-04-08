@@ -141,7 +141,7 @@ def _run_result_for_target(
     if key not in result.run_results:
         raise ValueError(
             f"deep dive target {target.variant_id!r}/{target.phase}/{target.label!r} "
-            "has no recorded BacktestResult."
+            "has no recorded BacktestResult. Rerun with retained run_results for deep-dive artifacts."
         )
     return result.run_results[key]
 
@@ -424,6 +424,7 @@ def _config_frame(result: ExperimentExecutionResult) -> pd.DataFrame:
     add("search", "mode", experiment.search.mode)
     add("search", "max_variants", experiment.search.max_variants)
     add("search", "max_runtime_seconds", experiment.search.max_runtime_seconds)
+    add("search", "max_parallel_variants", experiment.search.max_parallel_variants)
     add("search", "random_seed", experiment.search.random_seed)
 
     add("pruning", "stop_on_zero_equity", experiment.pruning.stop_on_zero_equity)

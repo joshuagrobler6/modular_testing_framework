@@ -5,21 +5,17 @@ from dataclasses import dataclass
 from trading_lab.contracts import ActionRequest, DecisionContext, NodeContract, NodeSpec
 from trading_lab.nodes.exit_shared import (
     action_request_exit,
-    atr_series,
+    atr_series_from_ctx,
     bars_held_from_ctx,
-    baseline_series,
-    closes_from_ctx,
-    current_close,
-    diff_series,
+    entry_index_from_ctx,
     entry_price_from_ctx,
-    highs_from_ctx,
-    lows_from_ctx,
-    macd_histogram_series,
+    full_price_series_from_ctx,
+    history_end_index,
+    macd_histogram_from_ctx,
     open_profit_points,
     position_direction,
-    scale_series,
-    slice_since_entry,
-    zscore_series,
+    slice_between_indices,
+    zscore_indicator_state_from_ctx,
 )
 from trading_lab.registry import register_exit
 
@@ -226,10 +222,9 @@ class CompositeReleaseExitNode:
                 f"open_profit_points={open_profit:.6f}"
             )
 
-        closes = closes_from_ctx(ctx)
-        highs = highs_from_ctx(ctx)
-        lows = lows_from_ctx(ctx)
-        close = current_close(ctx)
+        closes, highs, lows = full_price_series_from_ctx(ctx)
+        current_index = history_end_index(ctx)
+        close = closes[current_index]
 
         if entry_price is not None and self.profit_target_percent is not None:
             target_price = (
@@ -242,7 +237,7 @@ class CompositeReleaseExitNode:
                 return f"composite profit_target_percent={self.profit_target_percent:.6f}"
 
         if entry_price is not None and self.profit_target_atr_multiple is not None:
-            atr_target = atr_series(highs, lows, closes, self.atr_target_lookback)[-1]
+            atr_target = atr_series_from_ctx(ctx, self.atr_target_lookback)[current_index]
             if atr_target is not None and atr_target > 0.0:
                 target_distance = self.profit_target_atr_multiple * atr_target
                 target_price = entry_price + target_distance if direction == "long" else entry_price - target_distance
@@ -251,29 +246,50 @@ class CompositeReleaseExitNode:
                     return f"composite profit_target_atr_multiple={self.profit_target_atr_multiple:.6f}"
 
         if self.trailing_atr_lookback is not None and bars_held is not None and bars_held >= self.trailing_activation_bars:
-            atr_trail = atr_series(highs, lows, closes, self.trailing_atr_lookback)[-1]
+            entry_index = entry_index_from_ctx(ctx)
+            if entry_index is None:
+                return None
+            atr_trail = atr_series_from_ctx(ctx, self.trailing_atr_lookback)[current_index]
             if atr_trail is not None and atr_trail > 0.0:
                 if direction == "long":
-                    reference = max(slice_since_entry(highs, bars_held))
+                    reference = max(
+                        slice_between_indices(
+                            highs,
+                            start_index=entry_index,
+                            end_index=current_index,
+                        )
+                    )
                     stop = reference - self.trailing_atr_multiple * atr_trail
                     if close <= stop:
                         return f"composite trailing_atr stop={stop:.6f}"
                 else:
-                    reference = min(slice_since_entry(lows, bars_held))
+                    reference = min(
+                        slice_between_indices(
+                            lows,
+                            start_index=entry_index,
+                            end_index=current_index,
+                        )
+                    )
                     stop = reference + self.trailing_atr_multiple * atr_trail
                     if close >= stop:
                         return f"composite trailing_atr stop={stop:.6f}"
 
         if self.macd_fast_lookback is not None:
-            macd_line, signal_line, histogram = macd_histogram_series(
-                closes,
+            macd_line, signal_line, histogram = macd_histogram_from_ctx(
+                ctx,
                 fast_lookback=self.macd_fast_lookback,
                 slow_lookback=self.macd_slow_lookback,
                 signal_lookback=self.macd_signal_lookback,
             )
-            recent_hist = histogram[-self.macd_confirm_bars:]
-            recent_macd = macd_line[-self.macd_confirm_bars:]
-            recent_signal = signal_line[-self.macd_confirm_bars:]
+            macd_start = current_index - self.macd_confirm_bars + 1
+            if macd_start >= 0:
+                recent_hist = histogram[macd_start : current_index + 1]
+                recent_macd = macd_line[macd_start : current_index + 1]
+                recent_signal = signal_line[macd_start : current_index + 1]
+            else:
+                recent_hist = ()
+                recent_macd = ()
+                recent_signal = ()
             if direction == "long":
                 if all(value is not None and value < 0.0 for value in recent_hist):
                     return "composite macd_histogram_cross"
@@ -295,43 +311,61 @@ class CompositeReleaseExitNode:
             value is not None
             for value in (self.z_exit_threshold, self.z_gradient_threshold, self.z_acceleration_threshold)
         ):
-            baseline = baseline_series(closes, self.z_baseline_kind, self.z_baseline_lookback)
-            scale = scale_series(
-                closes=closes,
-                highs=highs,
-                lows=lows,
-                baseline=baseline,
+            _, _, _, z_values, z_gradients, z_accelerations = zscore_indicator_state_from_ctx(
+                ctx,
+                baseline_kind=self.z_baseline_kind,
+                baseline_lookback=self.z_baseline_lookback,
                 scale_kind=self.z_scale_kind,
                 scale_lookback=self.z_scale_lookback,
+                gradient_horizon=self.z_gradient_horizon,
+                acceleration_horizon=self.z_acceleration_horizon,
             )
-            z_values = zscore_series(closes, baseline, scale)
-            z_gradients = diff_series(z_values, self.z_gradient_horizon, divide_by_horizon=True)
-            z_accelerations = diff_series(z_gradients, self.z_acceleration_horizon, divide_by_horizon=False)
+            z_start = current_index - self.z_confirm_bars + 1
+            if z_start < 0:
+                z_recent = ()
+                gradient_recent = ()
+                acceleration_recent = ()
+            else:
+                z_recent = z_values[z_start : current_index + 1]
+                gradient_recent = z_gradients[z_start : current_index + 1]
+                acceleration_recent = z_accelerations[z_start : current_index + 1]
             if self.z_exit_threshold is not None:
-                recent = z_values[-self.z_confirm_bars:]
-                if direction == "long" and all(value is not None and value <= self.z_exit_threshold for value in recent):
+                if direction == "long" and all(value is not None and value <= self.z_exit_threshold for value in z_recent):
                     return "composite z_threshold_cross"
-                if direction == "short" and all(value is not None and value >= -self.z_exit_threshold for value in recent):
+                if direction == "short" and all(value is not None and value >= -self.z_exit_threshold for value in z_recent):
                     return "composite z_threshold_cross"
             if self.z_gradient_threshold is not None:
-                recent = z_gradients[-self.z_confirm_bars:]
-                if direction == "long" and all(value is not None and value <= -self.z_gradient_threshold for value in recent):
+                if direction == "long" and all(value is not None and value <= -self.z_gradient_threshold for value in gradient_recent):
                     return "composite z_gradient_flip"
-                if direction == "short" and all(value is not None and value >= self.z_gradient_threshold for value in recent):
+                if direction == "short" and all(value is not None and value >= self.z_gradient_threshold for value in gradient_recent):
                     return "composite z_gradient_flip"
             if self.z_acceleration_threshold is not None:
-                recent = z_accelerations[-self.z_confirm_bars:]
-                if direction == "long" and all(value is not None and value <= -self.z_acceleration_threshold for value in recent):
+                if direction == "long" and all(value is not None and value <= -self.z_acceleration_threshold for value in acceleration_recent):
                     return "composite z_acceleration_flip"
-                if direction == "short" and all(value is not None and value >= self.z_acceleration_threshold for value in recent):
+                if direction == "short" and all(value is not None and value >= self.z_acceleration_threshold for value in acceleration_recent):
                     return "composite z_acceleration_flip"
 
         if self.mfe_activation_profit_points is not None and bars_held is not None and entry_price is not None:
+            entry_index = entry_index_from_ctx(ctx)
+            if entry_index is None:
+                return None
             if direction == "long":
-                peak_profit = max(slice_since_entry(highs, bars_held)) - entry_price
+                peak_profit = max(
+                    slice_between_indices(
+                        highs,
+                        start_index=entry_index,
+                        end_index=current_index,
+                    )
+                ) - entry_price
                 current_profit = close - entry_price
             else:
-                peak_profit = entry_price - min(slice_since_entry(lows, bars_held))
+                peak_profit = entry_price - min(
+                    slice_between_indices(
+                        lows,
+                        start_index=entry_index,
+                        end_index=current_index,
+                    )
+                )
                 current_profit = entry_price - close
             if peak_profit >= self.mfe_activation_profit_points:
                 giveback = peak_profit - current_profit

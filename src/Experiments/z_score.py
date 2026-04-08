@@ -5,6 +5,7 @@ import os
 import sys
 from dataclasses import replace
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 
 import pandas as pd
@@ -38,6 +39,7 @@ from trading_lab import (
     SearchConfig,
     SearchRunConfig,
     VariantSpec,
+    run_backtest,
     run_search_entrypoint,
     validate_ohlcv,
 )
@@ -61,6 +63,7 @@ QUANTITY_INCREMENT = 1.0
 INITIAL_CASH = 100_000.0
 DEFAULT_MAX_RUNTIME_SECONDS = 600
 DEFAULT_RUNTIME_SECONDS_PER_VARIANT = 30
+DEFAULT_MAX_PARALLEL_VARIANTS = 4
 
 ENTRY_VARIANTS = (
     {
@@ -270,6 +273,7 @@ def build_run_config(data: pd.DataFrame, entry_contracts, exit_contracts, risk_c
             mode="grid",
             max_variants=len(variants),
             max_runtime_seconds=resolve_max_runtime_seconds(len(variants)),
+            max_parallel_variants=resolve_max_parallel_variants(),
             random_seed=17,
         ),
         outputs=OutputConfig(
@@ -289,6 +293,19 @@ def build_run_config(data: pd.DataFrame, entry_contracts, exit_contracts, risk_c
             constraints=(MetricConstraint("trade_count", minimum=1),),
         ),
     )
+
+
+def build_search_runner_kwargs(registry: NodeRegistry) -> dict[str, object]:
+    return {
+        "node_registry": registry,
+        "backtest_fn": partial(
+            run_backtest,
+            validate_outputs=False,
+            capture_decision_details=False,
+        ),
+        "retain_run_results": False,
+        "prepare_backtest_inputs": True,
+    }
 
 
 def infer_instrument(data: pd.DataFrame) -> InstrumentMeta:
@@ -316,6 +333,19 @@ def resolve_max_runtime_seconds(variant_count: int | None = None) -> int:
     if value <= 0:
         raise ValueError("Z_SCORE_MAX_RUNTIME_SECONDS must be positive.")
     return value
+
+
+def resolve_max_parallel_variants() -> int:
+    raw_value = os.getenv("Z_SCORE_MAX_PARALLEL_VARIANTS")
+    if raw_value is not None:
+        value = int(raw_value)
+        if value <= 0:
+            raise ValueError("Z_SCORE_MAX_PARALLEL_VARIANTS must be positive.")
+        return value
+
+    cpu_count = os.cpu_count() or 1
+    half_cores = max(cpu_count // 2, 1)
+    return min(DEFAULT_MAX_PARALLEL_VARIANTS, half_cores)
 
 
 def build_time_windows(data: pd.DataFrame) -> tuple[tuple[FoldSpec, ...], HoldoutSpec]:
@@ -409,7 +439,7 @@ def main() -> None:
     result = run_search_entrypoint(
         run_config,
         data,
-        runner_kwargs={"node_registry": registry},
+        runner_kwargs=build_search_runner_kwargs(registry),
     )
     print("data source:", data_source)
     print("entry variants:", len(entry_contracts))

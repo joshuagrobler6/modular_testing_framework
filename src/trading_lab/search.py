@@ -335,7 +335,8 @@ class SearchRunConfig:
     contract_version: str = DEFAULT_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
-        if not isinstance(self.experiment, ExperimentSpec):
+        object.__setattr__(self, "experiment", _coerce_experiment_spec(self.experiment))
+        if not isinstance(self.experiment, _current_experiment_spec_class()):
             raise TypeError("experiment must be an ExperimentSpec instance.")
         if not isinstance(self.objective, ObjectiveConfig):
             raise TypeError("objective must be an ObjectiveConfig instance.")
@@ -423,6 +424,22 @@ def _load_serialized_payload(
     return payload
 
 
+def _current_experiment_spec_class() -> type[Any]:
+    return importlib.import_module("trading_lab.experiments").ExperimentSpec
+
+
+def _coerce_experiment_spec(value: object) -> object:
+    current_experiment_spec = _current_experiment_spec_class()
+    if isinstance(value, current_experiment_spec):
+        return value
+    if isinstance(value, dict):
+        return _deserialize_dataclass(value, current_experiment_spec)
+    if hasattr(value, "__dataclass_fields__") and type(value).__name__ == "ExperimentSpec":
+        payload = json.loads(serialize_manifest(value))
+        return _deserialize_dataclass(payload, current_experiment_spec)
+    return value
+
+
 def _deserialize_value(value: Any, annotation: Any) -> Any:
     if annotation is Any:
         return value
@@ -489,13 +506,16 @@ def load_search_run_config(
     *,
     objective: ObjectiveConfig | None = None,
 ) -> SearchRunConfig:
+    current_experiment_spec = _current_experiment_spec_class()
+
     if isinstance(config, SearchRunConfig):
         if objective is not None and objective != config.objective:
             raise ValueError(
                 "objective must not be provided separately when config is a SearchRunConfig."
             )
         return config
-    if isinstance(config, ExperimentSpec):
+    config = _coerce_experiment_spec(config)
+    if isinstance(config, current_experiment_spec):
         if not isinstance(objective, ObjectiveConfig):
             raise TypeError(
                 "objective must be provided when config is an ExperimentSpec."
@@ -508,7 +528,7 @@ def load_search_run_config(
 
     payload = _load_serialized_payload(config)
     if "experiment" in payload and "objective" in payload:
-        experiment = _deserialize_dataclass(payload["experiment"], ExperimentSpec)
+        experiment = _deserialize_dataclass(payload["experiment"], current_experiment_spec)
         parsed_objective = _deserialize_dataclass(payload["objective"], ObjectiveConfig)
         return SearchRunConfig(
             experiment=experiment,
@@ -516,7 +536,7 @@ def load_search_run_config(
             contract_version=payload.get("contract_version", experiment.contract_version),
         )
 
-    experiment = _deserialize_dataclass(payload, ExperimentSpec)
+    experiment = _deserialize_dataclass(payload, current_experiment_spec)
     if not isinstance(objective, ObjectiveConfig):
         raise TypeError(
             "objective must be provided when serialized config contains only an ExperimentSpec."
@@ -687,7 +707,8 @@ def run_search_experiment(
     runner_fn: RunnerFn = run_experiment,
     runner_kwargs: dict[str, Any] | None = None,
 ) -> SearchExecutionResult:
-    if not isinstance(experiment, ExperimentSpec):
+    experiment = _coerce_experiment_spec(experiment)
+    if not isinstance(experiment, _current_experiment_spec_class()):
         raise TypeError("experiment must be an ExperimentSpec instance.")
     if not isinstance(data, pd.DataFrame):
         raise TypeError("data must be a pandas DataFrame.")
@@ -892,7 +913,8 @@ class OptunaSearchAdapter:
         runner_kwargs: dict[str, Any] | None = None,
         time_fn: TimeFn = time.perf_counter,
     ) -> SearchExecutionResult:
-        if not isinstance(base_experiment, ExperimentSpec):
+        base_experiment = _coerce_experiment_spec(base_experiment)
+        if not isinstance(base_experiment, _current_experiment_spec_class()):
             raise TypeError("base_experiment must be an ExperimentSpec instance.")
         if base_experiment.search.mode != "optuna":
             raise ValueError("OptunaSearchAdapter requires SearchConfig(mode='optuna').")
@@ -1078,6 +1100,11 @@ def _search_summary_frames(
         },
         {
             "section": "search",
+            "key": "max_parallel_variants",
+            "value": run_config.experiment.search.max_parallel_variants,
+        },
+        {
+            "section": "search",
             "key": "random_seed",
             "value": run_config.experiment.search.random_seed,
         },
@@ -1192,6 +1219,9 @@ def _export_selected_deep_dives(
     search_result: SearchExecutionResult,
     data: pd.DataFrame,
     output_dir: Path,
+    *,
+    runner_fn: RunnerFn,
+    runner_kwargs: dict[str, Any] | None,
 ) -> tuple[DeepDiveArtifactSet, ...]:
     deep_dive = run_config.experiment.deep_dive
     if deep_dive is None:
@@ -1207,9 +1237,16 @@ def _export_selected_deep_dives(
         )
         if not variant_ids:
             continue
+        deep_dive_result = _ensure_deep_dive_results(
+            experiment_result,
+            data,
+            variant_ids=variant_ids,
+            runner_fn=runner_fn,
+            runner_kwargs=runner_kwargs,
+        )
         artifacts.extend(
             export_deep_dive_artifacts(
-                experiment_result,
+                deep_dive_result,
                 data,
                 deep_dive_root,
                 selected_variant_ids=variant_ids,
@@ -1221,6 +1258,59 @@ def _export_selected_deep_dives(
             )
         )
     return tuple(artifacts)
+
+
+def _build_deep_dive_experiment(
+    experiment_result: ExperimentExecutionResult,
+    *,
+    variant_ids: tuple[str, ...],
+) -> ExperimentSpec:
+    variants = tuple(
+        variant
+        for variant in experiment_result.experiment.variants
+        if variant.variant_id in set(variant_ids)
+    )
+    if not variants:
+        raise ValueError("deep-dive rerun requires at least one matching variant.")
+    return replace(
+        experiment_result.experiment,
+        variants=variants,
+        search=replace(
+            experiment_result.experiment.search,
+            max_variants=len(variants),
+            max_runtime_seconds=None,
+            max_parallel_variants=1,
+        ),
+    )
+
+
+def _ensure_deep_dive_results(
+    experiment_result: ExperimentExecutionResult,
+    data: pd.DataFrame,
+    *,
+    variant_ids: tuple[str, ...],
+    runner_fn: RunnerFn,
+    runner_kwargs: dict[str, Any] | None,
+) -> ExperimentExecutionResult:
+    if experiment_result.run_results:
+        return experiment_result
+
+    rerun_kwargs = _normalize_runner_kwargs(runner_kwargs)
+    rerun_kwargs["retain_run_results"] = True
+    deep_dive_experiment = _build_deep_dive_experiment(
+        experiment_result,
+        variant_ids=variant_ids,
+    )
+    rerun_result = runner_fn(
+        deep_dive_experiment,
+        data,
+        **rerun_kwargs,
+    )
+    if not isinstance(rerun_result, ExperimentExecutionResult):
+        raise TypeError(
+            "runner_fn must return an ExperimentExecutionResult instance."
+        )
+    return rerun_result
 
 
 def _build_reproducibility_manifest(
@@ -1368,6 +1458,8 @@ def run_search_entrypoint(
         search_result,
         data,
         root_dir,
+        runner_fn=runner_fn,
+        runner_kwargs=runner_kwargs,
     )
     reproducibility_manifest = _build_reproducibility_manifest(
         run_config,
