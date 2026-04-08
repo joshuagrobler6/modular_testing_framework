@@ -18,14 +18,17 @@ def test_zscore_experiment_registers_expected_entry_variants() -> None:
 
     registry, entry_contracts, exit_contracts, risk_contract = namespace["build_components"]()
 
-    assert len(entry_contracts) == 12
-    assert len({contract.name for contract in entry_contracts}) == 12
+    assert len(entry_contracts) == 234
+    assert len({contract.name for contract in entry_contracts}) == 234
     assert entry_contracts[0].name.startswith("entry_zs_")
+    assert any(contract.name == "entry_ma_20x100" for contract in entry_contracts)
+    assert any(contract.name == "entry_ma_20x100_longonly" for contract in entry_contracts)
     assert registry.resolve("entry", entry_contracts[-1].name) is not None
-    assert len(exit_contracts) == 24
-    assert len({contract.name for contract in exit_contracts}) == 24
+    assert len(exit_contracts) == 103
+    assert len({contract.name for contract in exit_contracts}) == 103
     assert exit_contracts[0].name == "exit_time_5"
-    assert exit_contracts[-1].name == "exit_combo_mfe_macd"
+    assert any(contract.name == "exit_combo_time_trail_fast" for contract in exit_contracts)
+    assert exit_contracts[-1].name == "exit_combo_macd_zrelease"
     assert registry.resolve("exit", exit_contracts[-1].name) is not None
     assert risk_contract.name == "risk_fraction_05pct"
 

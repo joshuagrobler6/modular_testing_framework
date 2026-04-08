@@ -6,6 +6,7 @@ import sys
 from dataclasses import replace
 from datetime import datetime, timedelta
 from functools import partial
+from itertools import product
 from pathlib import Path
 
 import pandas as pd
@@ -47,6 +48,10 @@ from trading_lab.nodes.entry_zscore_state import (
     ZScoreStateEntryNode,
     build_entry_zscore_state_contract,
 )
+from trading_lab.nodes.entry_sma_cross import (
+    SMACrossEntryNode,
+    build_entry_sma_cross_contract,
+)
 from trading_lab.nodes.z_score_exit_grid_example import build_exit_contracts
 from trading_lab.nodes.risk_fixed_fraction import (
     FixedFractionRiskNode,
@@ -63,85 +68,34 @@ QUANTITY_INCREMENT = 1.0
 INITIAL_CASH = 100_000.0
 DEFAULT_MAX_RUNTIME_SECONDS = 600
 DEFAULT_RUNTIME_SECONDS_PER_VARIANT = 30
+DEFAULT_MAX_RUNTIME_CAP_SECONDS = 8 * 60 * 60
 DEFAULT_MAX_PARALLEL_VARIANTS = 4
 
-ENTRY_VARIANTS = (
+ZSCORE_ENTRY_BASELINE_KINDS = ("ema", "sma", "median")
+ZSCORE_ENTRY_BASELINE_LOOKBACKS = (10, 20, 40)
+ZSCORE_ENTRY_SCALE_KINDS = ("atr", "residual_std", "residual_mad")
+ZSCORE_ENTRY_SCALE_LOOKBACKS = (10, 20)
+ZSCORE_ENTRY_Z_THRESHOLDS = (0.5, 0.75, 1.0, 1.25)
+
+ZSCORE_GATED_ENTRY_VARIANTS = (
     {
         "baseline_kind": "ema",
-        "baseline_lookback": 10,
-        "scale_kind": "atr",
-        "scale_lookback": 10,
+        "baseline_lookback": 20,
+        "scale_kind": "residual_std",
+        "scale_lookback": 20,
         "z_threshold": 0.75,
+        "gradient_threshold": 0.03,
+        "gradient_horizon": 3,
+        "persistence_bars": 2,
+        "require_baseline_slope": True,
+        "baseline_slope_horizon": 5,
     },
     {
         "baseline_kind": "ema",
-        "baseline_lookback": 10,
-        "scale_kind": "atr",
-        "scale_lookback": 14,
+        "baseline_lookback": 20,
+        "scale_kind": "residual_std",
+        "scale_lookback": 20,
         "z_threshold": 1.0,
-    },
-    {
-        "baseline_kind": "sma",
-        "baseline_lookback": 10,
-        "scale_kind": "atr",
-        "scale_lookback": 10,
-        "z_threshold": 1.0,
-    },
-    {
-        "baseline_kind": "median",
-        "baseline_lookback": 10,
-        "scale_kind": "atr",
-        "scale_lookback": 10,
-        "z_threshold": 0.25,
-    },
-    {
-        "baseline_kind": "ema",
-        "baseline_lookback": 10,
-        "scale_kind": "residual_std",
-        "scale_lookback": 10,
-        "z_threshold": 0.25,
-    },
-    {
-        "baseline_kind": "sma",
-        "baseline_lookback": 10,
-        "scale_kind": "residual_std",
-        "scale_lookback": 10,
-        "z_threshold": 0.5,
-    },
-    {
-        "baseline_kind": "median",
-        "baseline_lookback": 10,
-        "scale_kind": "residual_std",
-        "scale_lookback": 10,
-        "z_threshold": 0.5,
-    },
-    {
-        "baseline_kind": "ema",
-        "baseline_lookback": 10,
-        "scale_kind": "residual_mad",
-        "scale_lookback": 10,
-        "z_threshold": 1.0,
-    },
-    {
-        "baseline_kind": "sma",
-        "baseline_lookback": 10,
-        "scale_kind": "residual_mad",
-        "scale_lookback": 10,
-        "z_threshold": 0.75,
-    },
-    {
-        "baseline_kind": "median",
-        "baseline_lookback": 10,
-        "scale_kind": "residual_mad",
-        "scale_lookback": 10,
-        "z_threshold": 0.5,
-    },
-    {
-        "baseline_kind": "ema",
-        "baseline_lookback": 10,
-        "scale_kind": "residual_std",
-        "scale_lookback": 10,
-        "z_threshold": 0.25,
         "gradient_threshold": 0.05,
         "gradient_horizon": 3,
         "persistence_bars": 2,
@@ -150,16 +104,129 @@ ENTRY_VARIANTS = (
     },
     {
         "baseline_kind": "sma",
-        "baseline_lookback": 10,
+        "baseline_lookback": 20,
         "scale_kind": "residual_std",
-        "scale_lookback": 10,
-        "z_threshold": 0.5,
+        "scale_lookback": 20,
+        "z_threshold": 0.75,
+        "gradient_threshold": 0.03,
+        "gradient_horizon": 3,
+        "persistence_bars": 2,
+        "require_baseline_slope": True,
+        "baseline_slope_horizon": 5,
+    },
+    {
+        "baseline_kind": "sma",
+        "baseline_lookback": 20,
+        "scale_kind": "residual_std",
+        "scale_lookback": 20,
+        "z_threshold": 1.0,
         "gradient_threshold": 0.05,
         "gradient_horizon": 3,
         "persistence_bars": 2,
         "require_baseline_slope": True,
         "baseline_slope_horizon": 5,
     },
+    {
+        "baseline_kind": "ema",
+        "baseline_lookback": 40,
+        "scale_kind": "atr",
+        "scale_lookback": 20,
+        "z_threshold": 0.75,
+        "gradient_threshold": 0.03,
+        "gradient_horizon": 5,
+        "persistence_bars": 3,
+        "require_baseline_slope": True,
+        "baseline_slope_horizon": 10,
+    },
+    {
+        "baseline_kind": "ema",
+        "baseline_lookback": 40,
+        "scale_kind": "atr",
+        "scale_lookback": 20,
+        "z_threshold": 1.0,
+        "gradient_threshold": 0.05,
+        "gradient_horizon": 5,
+        "persistence_bars": 3,
+        "require_baseline_slope": True,
+        "baseline_slope_horizon": 10,
+    },
+    {
+        "baseline_kind": "sma",
+        "baseline_lookback": 40,
+        "scale_kind": "atr",
+        "scale_lookback": 20,
+        "z_threshold": 0.75,
+        "gradient_threshold": 0.03,
+        "gradient_horizon": 5,
+        "persistence_bars": 3,
+        "require_baseline_slope": True,
+        "baseline_slope_horizon": 10,
+    },
+    {
+        "baseline_kind": "sma",
+        "baseline_lookback": 40,
+        "scale_kind": "atr",
+        "scale_lookback": 20,
+        "z_threshold": 1.0,
+        "gradient_threshold": 0.05,
+        "gradient_horizon": 5,
+        "persistence_bars": 3,
+        "require_baseline_slope": True,
+        "baseline_slope_horizon": 10,
+    },
+    {
+        "baseline_kind": "median",
+        "baseline_lookback": 20,
+        "scale_kind": "residual_mad",
+        "scale_lookback": 20,
+        "z_threshold": 0.75,
+        "gradient_threshold": 0.03,
+        "gradient_horizon": 3,
+        "persistence_bars": 2,
+    },
+    {
+        "baseline_kind": "median",
+        "baseline_lookback": 20,
+        "scale_kind": "residual_mad",
+        "scale_lookback": 20,
+        "z_threshold": 1.0,
+        "gradient_threshold": 0.05,
+        "gradient_horizon": 3,
+        "persistence_bars": 2,
+    },
+    {
+        "baseline_kind": "ema",
+        "baseline_lookback": 40,
+        "scale_kind": "residual_std",
+        "scale_lookback": 20,
+        "z_threshold": 1.0,
+        "gradient_threshold": 0.05,
+        "gradient_horizon": 3,
+        "persistence_bars": 2,
+        "require_baseline_slope": True,
+        "baseline_slope_horizon": 5,
+    },
+    {
+        "baseline_kind": "sma",
+        "baseline_lookback": 40,
+        "scale_kind": "residual_std",
+        "scale_lookback": 20,
+        "z_threshold": 1.0,
+        "gradient_threshold": 0.05,
+        "gradient_horizon": 3,
+        "persistence_bars": 2,
+        "require_baseline_slope": True,
+        "baseline_slope_horizon": 5,
+    },
+)
+
+MA_CROSS_ENTRY_VARIANTS = (
+    {"fast_window": 10, "slow_window": 50, "allow_short_signals": True},
+    {"fast_window": 20, "slow_window": 100, "allow_short_signals": True},
+    {"fast_window": 50, "slow_window": 200, "allow_short_signals": True},
+    {"fast_window": 10, "slow_window": 50, "allow_short_signals": False},
+    {"fast_window": 20, "slow_window": 100, "allow_short_signals": False},
+    {"fast_window": 50, "slow_window": 200, "allow_short_signals": False},
 )
 
 
@@ -208,17 +275,50 @@ def resolve_data_path() -> Path | None:
     return None
 
 
-def build_entry_parameter_sets() -> tuple[dict[str, object], ...]:
-    return tuple(dict(parameters) for parameters in ENTRY_VARIANTS)
+def build_zscore_entry_parameter_sets() -> tuple[dict[str, object], ...]:
+    parameter_sets: list[dict[str, object]] = []
+    for (
+        baseline_kind,
+        baseline_lookback,
+        scale_kind,
+        scale_lookback,
+        z_threshold,
+    ) in product(
+        ZSCORE_ENTRY_BASELINE_KINDS,
+        ZSCORE_ENTRY_BASELINE_LOOKBACKS,
+        ZSCORE_ENTRY_SCALE_KINDS,
+        ZSCORE_ENTRY_SCALE_LOOKBACKS,
+        ZSCORE_ENTRY_Z_THRESHOLDS,
+    ):
+        parameter_sets.append(
+            {
+                "baseline_kind": baseline_kind,
+                "baseline_lookback": baseline_lookback,
+                "scale_kind": scale_kind,
+                "scale_lookback": scale_lookback,
+                "z_threshold": z_threshold,
+            }
+        )
+    parameter_sets.extend(dict(parameters) for parameters in ZSCORE_GATED_ENTRY_VARIANTS)
+    return tuple(parameter_sets)
+
+
+def build_ma_cross_entry_parameter_sets() -> tuple[dict[str, object], ...]:
+    return tuple(dict(parameters) for parameters in MA_CROSS_ENTRY_VARIANTS)
 
 
 def build_components():
     registry = NodeRegistry()
     entry_contracts = []
-    for parameters in build_entry_parameter_sets():
+    for parameters in build_zscore_entry_parameter_sets():
         name = build_entry_variant_name(parameters)
         contract = build_entry_zscore_state_contract(name=name, **parameters)
         registry.register("entry", name, ZScoreStateEntryNode(**parameters), contract)
+        entry_contracts.append(contract)
+    for parameters in build_ma_cross_entry_parameter_sets():
+        name = build_ma_cross_entry_name(parameters)
+        contract = build_entry_sma_cross_contract(name=name, **parameters)
+        registry.register("entry", name, SMACrossEntryNode(**parameters), contract)
         entry_contracts.append(contract)
 
     exit_contracts = tuple(build_exit_contracts(registry))
@@ -326,7 +426,10 @@ def resolve_max_runtime_seconds(variant_count: int | None = None) -> int:
             return DEFAULT_MAX_RUNTIME_SECONDS
         return max(
             DEFAULT_MAX_RUNTIME_SECONDS,
-            variant_count * DEFAULT_RUNTIME_SECONDS_PER_VARIANT,
+            min(
+                variant_count * DEFAULT_RUNTIME_SECONDS_PER_VARIANT,
+                DEFAULT_MAX_RUNTIME_CAP_SECONDS,
+            ),
         )
 
     value = int(raw_value)
@@ -411,6 +514,16 @@ def build_entry_variant_name(parameters: dict[str, object]) -> str:
         parts.append(f"a{_number_token(float(acceleration_threshold))}")
     if bool(parameters.get("require_baseline_slope", False)):
         parts.append(f"slope{int(parameters.get('baseline_slope_horizon', 1))}")
+    if not bool(parameters.get("allow_short_signals", True)):
+        parts.append("longonly")
+    return "_".join(parts)
+
+
+def build_ma_cross_entry_name(parameters: dict[str, object]) -> str:
+    parts = [
+        "entry_ma",
+        f"{int(parameters['fast_window'])}x{int(parameters['slow_window'])}",
+    ]
     if not bool(parameters.get("allow_short_signals", True)):
         parts.append("longonly")
     return "_".join(parts)
