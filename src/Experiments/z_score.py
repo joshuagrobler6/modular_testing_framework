@@ -70,6 +70,10 @@ DEFAULT_MAX_RUNTIME_SECONDS = 600
 DEFAULT_RUNTIME_SECONDS_PER_VARIANT = 30
 DEFAULT_MAX_RUNTIME_CAP_SECONDS = 8 * 60 * 60
 DEFAULT_MAX_PARALLEL_VARIANTS = 4
+DEFAULT_MAX_TRIALS = 1000
+DEFAULT_MIN_TRADES = 20
+DEFAULT_EARLY_MIN_FOLD_TRADES = 5
+DEFAULT_EARLY_MIN_BARS = 5000
 
 ZSCORE_ENTRY_BASELINE_KINDS = ("ema", "sma", "median")
 ZSCORE_ENTRY_BASELINE_LOOKBACKS = (10, 20, 40)
@@ -370,10 +374,10 @@ def build_run_config(data: pd.DataFrame, entry_contracts, exit_contracts, risk_c
         folds=folds,
         holdout=holdout,
         search=SearchConfig(
-            mode="grid",
-            max_variants=len(variants),
+            mode="optuna",
+            max_variants=resolve_max_trials(len(variants)),
             max_runtime_seconds=resolve_max_runtime_seconds(len(variants)),
-            max_parallel_variants=resolve_max_parallel_variants(),
+            max_parallel_variants=1,
             random_seed=17,
         ),
         outputs=OutputConfig(
@@ -383,14 +387,19 @@ def build_run_config(data: pd.DataFrame, entry_contracts, exit_contracts, risk_c
         ),
         pruning=PruningConfig(
             stop_on_invalid_numeric_state=False,
-            min_trades=1,
+            min_trades=resolve_min_trades(),
+            early_min_trades=resolve_early_min_fold_trades(),
+            early_min_bars=resolve_early_min_bars(),
+            early_metric_thresholds={
+                "trade_count": float(resolve_early_min_fold_trades()),
+            },
         ),
     )
     return SearchRunConfig(
         experiment=experiment,
         objective=ObjectiveConfig.single_metric(
             "net_pnl",
-            constraints=(MetricConstraint("trade_count", minimum=1),),
+            constraints=(MetricConstraint("trade_count", minimum=resolve_min_trades()),),
         ),
     )
 
@@ -449,6 +458,46 @@ def resolve_max_parallel_variants() -> int:
     cpu_count = os.cpu_count() or 1
     half_cores = max(cpu_count // 2, 1)
     return min(DEFAULT_MAX_PARALLEL_VARIANTS, half_cores)
+
+
+def resolve_max_trials(variant_count: int) -> int:
+    raw_value = os.getenv("Z_SCORE_MAX_TRIALS")
+    if raw_value is not None:
+        value = int(raw_value)
+        if value <= 0:
+            raise ValueError("Z_SCORE_MAX_TRIALS must be positive.")
+        return min(value, variant_count)
+    return min(DEFAULT_MAX_TRIALS, variant_count)
+
+
+def resolve_min_trades() -> int:
+    raw_value = os.getenv("Z_SCORE_MIN_TRADES")
+    if raw_value is not None:
+        value = int(raw_value)
+        if value < 1:
+            raise ValueError("Z_SCORE_MIN_TRADES must be >= 1.")
+        return value
+    return DEFAULT_MIN_TRADES
+
+
+def resolve_early_min_fold_trades() -> int:
+    raw_value = os.getenv("Z_SCORE_EARLY_MIN_FOLD_TRADES")
+    if raw_value is not None:
+        value = int(raw_value)
+        if value < 1:
+            raise ValueError("Z_SCORE_EARLY_MIN_FOLD_TRADES must be >= 1.")
+        return value
+    return DEFAULT_EARLY_MIN_FOLD_TRADES
+
+
+def resolve_early_min_bars() -> int:
+    raw_value = os.getenv("Z_SCORE_EARLY_MIN_BARS")
+    if raw_value is not None:
+        value = int(raw_value)
+        if value < 1:
+            raise ValueError("Z_SCORE_EARLY_MIN_BARS must be >= 1.")
+        return value
+    return DEFAULT_EARLY_MIN_BARS
 
 
 def build_time_windows(data: pd.DataFrame) -> tuple[tuple[FoldSpec, ...], HoldoutSpec]:
@@ -529,6 +578,48 @@ def build_ma_cross_entry_name(parameters: dict[str, object]) -> str:
     return "_".join(parts)
 
 
+def build_optuna_variant_factory(
+    run_config: SearchRunConfig,
+    entry_contracts,
+    exit_contracts,
+    risk_contract,
+):
+    if not run_config.experiment.variants:
+        raise ValueError("run_config must contain at least one template variant.")
+
+    base_spec = replace(
+        run_config.experiment.variants[0].backtest_spec,
+        name="zscore_optuna_template",
+        entry_node="placeholder_entry",
+        exit_node="placeholder_exit",
+        risk_node=risk_contract.name,
+    )
+    entry_by_name = {contract.name: contract for contract in entry_contracts}
+    exit_by_name = {contract.name: contract for contract in exit_contracts}
+    entry_names = tuple(sorted(entry_by_name))
+    exit_names = tuple(sorted(exit_by_name))
+
+    def variant_factory(trial):
+        entry_name = trial.suggest_categorical("entry_node", entry_names)
+        exit_name = trial.suggest_categorical("exit_node", exit_names)
+        entry_contract = entry_by_name[entry_name]
+        exit_contract = exit_by_name[exit_name]
+        return VariantSpec(
+            backtest_spec=replace(
+                base_spec,
+                name=f"{entry_name}__{exit_name}__{risk_contract.name}",
+                entry_node=entry_name,
+                exit_node=exit_name,
+                risk_node=risk_contract.name,
+            ),
+            entry_contract=entry_contract,
+            exit_contract=exit_contract,
+            risk_contract=risk_contract,
+        )
+
+    return variant_factory
+
+
 def _number_token(value: float) -> str:
     return f"{int(round(value * 100.0)):03d}"
 
@@ -553,6 +644,12 @@ def main() -> None:
         run_config,
         data,
         runner_kwargs=build_search_runner_kwargs(registry),
+        variant_factory=build_optuna_variant_factory(
+            run_config,
+            entry_contracts,
+            exit_contracts,
+            risk_contract,
+        ),
     )
     print("data source:", data_source)
     print("entry variants:", len(entry_contracts))

@@ -106,6 +106,30 @@ def _normalize_runner_kwargs(
     return dict(runner_kwargs)
 
 
+def _normalize_metric_payload(value: object) -> object:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        normalized: dict[str, object] = {}
+        for key in sorted(value, key=lambda item: str(item)):
+            normalized[str(key)] = _normalize_metric_payload(value[key])
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [_normalize_metric_payload(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted(
+            (_normalize_metric_payload(item) for item in value),
+            key=lambda item: str(item),
+        )
+    return value
+
+
 def _metric_number(metrics: dict[str, Any], metric_name: str) -> float | None:
     if metric_name not in metrics:
         return None
@@ -1058,11 +1082,11 @@ def _search_summary_frames(
                 "feasible": evaluation.feasible,
                 "constraint_violations": "|".join(evaluation.constraint_violations),
                 "runtime_seconds": evaluation.runtime_seconds,
-                "cv_metrics": serialize_manifest(evaluation.cv_metrics),
+                "cv_metrics": serialize_manifest(_normalize_metric_payload(evaluation.cv_metrics)),
                 "holdout_metrics": (
                     None
                     if evaluation.holdout_metrics is None
-                    else serialize_manifest(evaluation.holdout_metrics)
+                    else serialize_manifest(_normalize_metric_payload(evaluation.holdout_metrics))
                 ),
                 "source_label": evaluation.source_label,
             }
