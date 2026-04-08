@@ -45,10 +45,7 @@ from trading_lab.nodes.entry_zscore_state import (
     ZScoreStateEntryNode,
     build_entry_zscore_state_contract,
 )
-from trading_lab.nodes.exit_time_stop import (
-    TimeStopExitNode,
-    build_exit_time_stop_contract,
-)
+from trading_lab.nodes.z_score_exit_grid_example import build_exit_contracts
 from trading_lab.nodes.risk_fixed_fraction import (
     FixedFractionRiskNode,
     build_risk_fixed_fraction_contract,
@@ -63,6 +60,7 @@ PRICE_INCREMENT = 0.01
 QUANTITY_INCREMENT = 1.0
 INITIAL_CASH = 100_000.0
 DEFAULT_MAX_RUNTIME_SECONDS = 600
+DEFAULT_RUNTIME_SECONDS_PER_VARIANT = 30
 
 ENTRY_VARIANTS = (
     {
@@ -220,23 +218,22 @@ def build_components():
         registry.register("entry", name, ZScoreStateEntryNode(**parameters), contract)
         entry_contracts.append(contract)
 
-    exit_contract = build_exit_time_stop_contract(name="exit_time_10", hold_bars=10)
+    exit_contracts = tuple(build_exit_contracts(registry))
     risk_contract = build_risk_fixed_fraction_contract(
         name="risk_fraction_05pct",
         capital_fraction=0.05,
         max_holding_bars=12,
     )
-    registry.register("exit", exit_contract.name, TimeStopExitNode(hold_bars=10), exit_contract)
     registry.register(
         "risk",
         risk_contract.name,
         FixedFractionRiskNode(capital_fraction=0.05, max_holding_bars=12),
         risk_contract,
     )
-    return registry, tuple(entry_contracts), exit_contract, risk_contract
+    return registry, tuple(entry_contracts), exit_contracts, risk_contract
 
 
-def build_run_config(data: pd.DataFrame, entry_contracts, exit_contract, risk_contract) -> SearchRunConfig:
+def build_run_config(data: pd.DataFrame, entry_contracts, exit_contracts, risk_contract) -> SearchRunConfig:
     instrument = infer_instrument(data)
     folds, holdout = build_time_windows(data)
     base_spec = BacktestSpec(
@@ -262,6 +259,7 @@ def build_run_config(data: pd.DataFrame, entry_contracts, exit_contract, risk_co
             risk_contract=risk_contract,
         )
         for entry_contract in entry_contracts
+        for exit_contract in exit_contracts
     )
     experiment = ExperimentSpec(
         name="zscore_signal_quality",
@@ -271,7 +269,7 @@ def build_run_config(data: pd.DataFrame, entry_contracts, exit_contract, risk_co
         search=SearchConfig(
             mode="grid",
             max_variants=len(variants),
-            max_runtime_seconds=resolve_max_runtime_seconds(),
+            max_runtime_seconds=resolve_max_runtime_seconds(len(variants)),
             random_seed=17,
         ),
         outputs=OutputConfig(
@@ -304,10 +302,15 @@ def infer_instrument(data: pd.DataFrame) -> InstrumentMeta:
     )
 
 
-def resolve_max_runtime_seconds() -> int:
+def resolve_max_runtime_seconds(variant_count: int | None = None) -> int:
     raw_value = os.getenv("Z_SCORE_MAX_RUNTIME_SECONDS")
     if raw_value is None:
-        return DEFAULT_MAX_RUNTIME_SECONDS
+        if variant_count is None:
+            return DEFAULT_MAX_RUNTIME_SECONDS
+        return max(
+            DEFAULT_MAX_RUNTIME_SECONDS,
+            variant_count * DEFAULT_RUNTIME_SECONDS_PER_VARIANT,
+        )
 
     value = int(raw_value)
     if value <= 0:
@@ -401,8 +404,8 @@ def main() -> None:
     data = load_data()
     data_path = resolve_data_path()
     data_source = str(data_path) if data_path is not None else "built-in demo data"
-    registry, entry_contracts, exit_contract, risk_contract = build_components()
-    run_config = build_run_config(data, entry_contracts, exit_contract, risk_contract)
+    registry, entry_contracts, exit_contracts, risk_contract = build_components()
+    run_config = build_run_config(data, entry_contracts, exit_contracts, risk_contract)
     result = run_search_entrypoint(
         run_config,
         data,
@@ -410,6 +413,8 @@ def main() -> None:
     )
     print("data source:", data_source)
     print("entry variants:", len(entry_contracts))
+    print("exit variants:", len(exit_contracts))
+    print("total variants:", len(run_config.experiment.variants))
     print("summary workbook:", result.summary_workbook_path)
     print("best variant_id:", result.search_result.best_variant_id)
     print("stopping reason:", result.stopping_reason)
