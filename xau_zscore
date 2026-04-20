@@ -1,0 +1,462 @@
+#property strict
+#property version   "1.00"
+#property description "Long-only XAUUSD Strategy A dual-zscore with z-percentile basket exits and basket risk cap"
+
+#include <Trade/Trade.mqh>
+
+enum ENUM_STOP_MODE
+{
+   STOP_FIXED_POINTS = 0,
+   STOP_ATR_BOUNDED  = 1
+};
+
+input ulong          InpMagic                     = 260602;
+input double         InpLots                      = 0.01;
+input int            InpSlippagePoints            = 20;
+input bool           InpDebugPrint                = false;
+
+input int            InpRegimeLookback            = 500;
+input int            InpPercentileLookback        = 500;
+input double         InpExitPct                   = 30.0;
+
+input bool           InpEdgeTrigger               = true;
+input bool           InpAllowFirstArmedEntry      = true;
+input int            InpMaxPositions              = 5;
+input bool           InpExitClosesAll             = true;
+
+input int            InpA_EmaFast                 = 34;
+input int            InpA_EmaSlow                 = 144;
+input int            InpA_StdSpan                 = 55;
+input double         InpA_ZArm                    = 1.0;
+input int            InpA_ZSlopeN                 = 3;
+input double         InpA_Gamma                   = 0.07;
+
+input bool           InpUseStopLoss               = true;
+input ENUM_STOP_MODE InpStopMode                  = STOP_ATR_BOUNDED;
+input int            InpStopLossPoints            = 1500;
+input int            InpStopATRPeriod             = 100;
+input double         InpStopATRMultiple           = 1.5;
+input double         InpStopMinPrice              = 10.0;
+input double         InpStopMaxPrice              = 25.0;
+
+input bool           InpUseBasketRiskCap          = true;
+input double         InpBasketRiskMultiple        = 2.5;
+
+CTrade trade;
+
+int g_ema_fast_handle = INVALID_HANDLE;
+int g_ema_slow_handle = INVALID_HANDLE;
+int g_atr_handle      = INVALID_HANDLE;
+datetime g_last_bar_time = 0;
+bool g_initialized = false;
+
+bool IsNewBar()
+{
+   const datetime current_bar = iTime(_Symbol, _Period, 0);
+   if(current_bar == 0)
+      return false;
+
+   if(g_last_bar_time == 0)
+   {
+      g_last_bar_time = current_bar;
+      return false;
+   }
+
+   if(current_bar != g_last_bar_time)
+   {
+      g_last_bar_time = current_bar;
+      return true;
+   }
+
+   return false;
+}
+
+double ClampMin(const double value, const double minimum)
+{
+   return (value < minimum ? minimum : value);
+}
+
+double NormalizePrice(const double price)
+{
+   return NormalizeDouble(price, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+}
+
+double StopLevelDistance()
+{
+   return (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+}
+
+int CountPositionsByMagic(const string symbol, const long magic, const ENUM_POSITION_TYPE position_type)
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != symbol)
+         continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != magic)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != position_type)
+         continue;
+      ++count;
+   }
+   return count;
+}
+
+bool ClosePositionsByMagic(const string symbol, const long magic, const ENUM_POSITION_TYPE position_type)
+{
+   bool ok_all = true;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != symbol)
+         continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != magic)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != position_type)
+         continue;
+
+      if(!trade.PositionClose(ticket))
+      {
+         ok_all = false;
+         if(InpDebugPrint)
+            Print("Close failed ticket=", ticket, " retcode=", trade.ResultRetcode(), " err=", GetLastError());
+      }
+   }
+   return ok_all;
+}
+
+bool CopyIndicatorSeries(const int handle, const int count, double &buffer[])
+{
+   ArrayResize(buffer, count);
+   ArraySetAsSeries(buffer, true);
+   return (CopyBuffer(handle, 0, 1, count, buffer) == count);
+}
+
+bool EwmStdSeries(const double &values[], const int count, const int span, double &out_std[])
+{
+   if(span < 2 || count < 2)
+      return false;
+
+   ArrayResize(out_std, count);
+   ArraySetAsSeries(out_std, true);
+
+   const double alpha = 2.0 / (span + 1.0);
+   double xr[];
+   double sr[];
+   ArrayResize(xr, count);
+   ArrayResize(sr, count);
+
+   for(int i = 0; i < count; ++i)
+      xr[i] = values[count - 1 - i];
+
+   double mean = xr[0];
+   double variance = 0.0;
+   sr[0] = 0.0;
+
+   for(int i = 1; i < count; ++i)
+   {
+      mean = alpha * xr[i] + (1.0 - alpha) * mean;
+      const double diff = xr[i] - mean;
+      variance = alpha * diff * diff + (1.0 - alpha) * variance;
+      if(variance < 0.0)
+         variance = 0.0;
+      sr[i] = MathSqrt(variance);
+   }
+
+   for(int i = 0; i < count; ++i)
+      out_std[i] = sr[count - 1 - i];
+
+   return true;
+}
+
+int RegimeOf(const double vol, const double q33, const double q66)
+{
+   if(vol <= q33)
+      return 0;
+   if(vol <= q66)
+      return 1;
+   return 2;
+}
+
+double QuantileFromSorted(const double &sorted_values[], const int count, const double q)
+{
+   if(count <= 0)
+      return 0.0;
+   const int idx = (int)MathFloor(q * (count - 1));
+   return sorted_values[MathMax(0, MathMin(count - 1, idx))];
+}
+
+double CurrentATRStopDistance()
+{
+   double atr_vals[];
+   if(!CopyIndicatorSeries(g_atr_handle, 2, atr_vals))
+      return 0.0;
+
+   double distance = atr_vals[0] * InpStopATRMultiple;
+   if(distance <= 0.0)
+      return 0.0;
+
+   distance = MathMax(distance, InpStopMinPrice);
+   distance = MathMin(distance, InpStopMaxPrice);
+   return distance;
+}
+
+double ResolveStopDistancePrice()
+{
+   if(!InpUseStopLoss)
+      return 0.0;
+
+   if(InpStopMode == STOP_FIXED_POINTS)
+      return (double)InpStopLossPoints * _Point;
+
+   return CurrentATRStopDistance();
+}
+
+double BuildStopLossPrice(const double ask_price)
+{
+   const double stop_distance = ResolveStopDistancePrice();
+   if(stop_distance <= 0.0)
+      return 0.0;
+
+   double sl = ask_price - stop_distance;
+   const double min_gap = StopLevelDistance();
+   if(sl >= ask_price - min_gap)
+      sl = ask_price - min_gap;
+
+   sl = NormalizePrice(sl);
+   if(sl <= 0.0 || sl >= ask_price)
+      return 0.0;
+
+   return sl;
+}
+
+double TradeRiskMoney(const double volume, const double entry_price, const double stop_price)
+{
+   if(volume <= 0.0 || stop_price <= 0.0 || stop_price >= entry_price)
+      return 0.0;
+
+   double pnl = 0.0;
+   if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, volume, entry_price, stop_price, pnl))
+      return 0.0;
+
+   return MathMax(0.0, -pnl);
+}
+
+double OpenRiskMoney()
+{
+   double risk = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != (long)InpMagic)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY)
+         continue;
+
+      const double volume = PositionGetDouble(POSITION_VOLUME);
+      const double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      const double sl = PositionGetDouble(POSITION_SL);
+      risk += TradeRiskMoney(volume, entry, sl);
+   }
+   return risk;
+}
+
+bool BasketRiskAllows(const double new_trade_risk)
+{
+   if(!InpUseBasketRiskCap || !InpUseStopLoss || InpBasketRiskMultiple <= 0.0)
+      return true;
+   if(new_trade_risk <= 0.0)
+      return false;
+
+   const double max_open_risk_money = new_trade_risk * InpBasketRiskMultiple;
+   const double open_risk_money = OpenRiskMoney();
+   return (open_risk_money + new_trade_risk <= max_open_risk_money + 1e-8);
+}
+
+bool ComputeSignals(bool &enter_long, bool &exit_long, double &z0, double &pct0)
+{
+   enter_long = false;
+   exit_long = false;
+   z0 = 0.0;
+   pct0 = 100.0;
+
+   const int slope_n = MathMax(1, InpA_ZSlopeN);
+   const int need = MathMax(MathMax(InpRegimeLookback, InpPercentileLookback), InpA_StdSpan) + InpA_EmaSlow + slope_n + 20;
+   if(Bars(_Symbol, _Period) < need + 10)
+      return false;
+
+   double ema_fast[];
+   double ema_slow[];
+   if(!CopyIndicatorSeries(g_ema_fast_handle, need, ema_fast))
+      return false;
+   if(!CopyIndicatorSeries(g_ema_slow_handle, need, ema_slow))
+      return false;
+
+   double spread[];
+   ArrayResize(spread, need);
+   ArraySetAsSeries(spread, true);
+   for(int i = 0; i < need; ++i)
+      spread[i] = ema_fast[i] - ema_slow[i];
+
+   double vol_std[];
+   if(!EwmStdSeries(spread, need, InpA_StdSpan, vol_std))
+      return false;
+
+   double z[];
+   ArrayResize(z, need);
+   ArraySetAsSeries(z, true);
+   for(int i = 0; i < need; ++i)
+      z[i] = spread[i] / ClampMin(vol_std[i], 1e-12);
+
+   z0 = z[0];
+   if(1 + slope_n >= need)
+      return false;
+
+   const double slope0 = (z[0] - z[slope_n]) / (double)slope_n;
+   const double slope_prev = (z[1] - z[1 + slope_n]) / (double)slope_n;
+   const bool now_armed = (z[0] >= InpA_ZArm && slope0 >= InpA_Gamma);
+   const bool prev_armed = (z[1] >= InpA_ZArm && slope_prev >= InpA_Gamma);
+
+   if(!g_initialized && InpAllowFirstArmedEntry)
+      enter_long = now_armed;
+   else
+      enter_long = (InpEdgeTrigger ? (now_armed && !prev_armed) : now_armed);
+
+   g_initialized = true;
+
+   const int regime_count = MathMin(InpRegimeLookback, need);
+   double vols[];
+   ArrayResize(vols, regime_count);
+   for(int i = 0; i < regime_count; ++i)
+      vols[i] = vol_std[i];
+   ArraySort(vols);
+
+   const double q33 = QuantileFromSorted(vols, regime_count, 0.33);
+   const double q66 = QuantileFromSorted(vols, regime_count, 0.66);
+   const int current_regime = RegimeOf(vol_std[0], q33, q66);
+
+   int n = 0;
+   int le = 0;
+   const int limit = MathMin(InpPercentileLookback, need);
+   for(int i = 0; i < limit; ++i)
+   {
+      if(RegimeOf(vol_std[i], q33, q66) != current_regime)
+         continue;
+      ++n;
+      if(z[i] <= z0)
+         ++le;
+   }
+
+   if(n < 30)
+   {
+      n = limit;
+      le = 0;
+      for(int i = 0; i < limit; ++i)
+      {
+         if(z[i] <= z0)
+            ++le;
+      }
+   }
+
+   pct0 = (n > 0 ? 100.0 * (double)le / (double)n : 100.0);
+   exit_long = (pct0 <= InpExitPct);
+
+   if(InpDebugPrint)
+      PrintFormat("A: z=%.5f slope=%.5f enter=%d exit=%d pct=%.2f regime=%d",
+                  z0, slope0, (int)enter_long, (int)exit_long, pct0, current_regime);
+
+   return true;
+}
+
+int OnInit()
+{
+   trade.SetExpertMagicNumber((long)InpMagic);
+   trade.SetDeviationInPoints(InpSlippagePoints);
+
+   g_initialized = false;
+   g_last_bar_time = iTime(_Symbol, _Period, 0);
+
+   g_ema_fast_handle = iMA(_Symbol, _Period, InpA_EmaFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema_slow_handle = iMA(_Symbol, _Period, InpA_EmaSlow, 0, MODE_EMA, PRICE_CLOSE);
+   g_atr_handle = iATR(_Symbol, _Period, InpStopATRPeriod);
+
+   if(g_ema_fast_handle == INVALID_HANDLE || g_ema_slow_handle == INVALID_HANDLE || g_atr_handle == INVALID_HANDLE)
+   {
+      Print("Failed to create indicator handles");
+      return INIT_FAILED;
+   }
+
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   if(g_ema_fast_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_fast_handle);
+   if(g_ema_slow_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_slow_handle);
+   if(g_atr_handle != INVALID_HANDLE)
+      IndicatorRelease(g_atr_handle);
+}
+
+void OnTick()
+{
+   if(!IsNewBar())
+      return;
+
+   bool enter_long = false;
+   bool exit_long = false;
+   double z0 = 0.0;
+   double pct0 = 100.0;
+   if(!ComputeSignals(enter_long, exit_long, z0, pct0))
+      return;
+
+   if(exit_long && InpExitClosesAll)
+   {
+      ClosePositionsByMagic(_Symbol, (long)InpMagic, POSITION_TYPE_BUY);
+      return;
+   }
+
+   if(enter_long)
+   {
+      const int open_buys = CountPositionsByMagic(_Symbol, (long)InpMagic, POSITION_TYPE_BUY);
+      if(open_buys >= InpMaxPositions)
+         return;
+
+      MqlTick tick;
+      if(!SymbolInfoTick(_Symbol, tick))
+         return;
+
+      double sl = 0.0;
+      if(InpUseStopLoss)
+      {
+         sl = BuildStopLossPrice(tick.ask);
+         if(sl <= 0.0)
+            return;
+      }
+
+      const double new_trade_risk = TradeRiskMoney(InpLots, tick.ask, sl);
+      if(InpUseBasketRiskCap && !BasketRiskAllows(new_trade_risk))
+      {
+         if(InpDebugPrint)
+            PrintFormat("Basket risk cap blocked entry. new_risk=%.2f open_risk=%.2f multiple=%.2f",
+                        new_trade_risk, OpenRiskMoney(), InpBasketRiskMultiple);
+         return;
+      }
+
+      if(!trade.Buy(InpLots, _Symbol, 0.0, sl, 0.0))
+      {
+         if(InpDebugPrint)
+            Print("BUY failed retcode=", trade.ResultRetcode(), " err=", GetLastError());
+      }
+   }
+}
