@@ -1,0 +1,819 @@
+#property strict
+#property version   "1.00"
+#property description "US100 M5 gap reentry SQ2 medium-only winner: state-aware sizing with profit-only slow-MA exit deferral for medium/high states"
+
+#include <Trade/Trade.mqh>
+
+enum ENUM_POSITION_SIZING_MODE
+{
+   POSITION_SIZE_FIXED_FRACTIONAL = 0,
+   POSITION_SIZE_FIXED_LOTS       = 1
+};
+
+enum ENUM_STATE_TIER
+{
+   STATE_TIER_LOW    = 0,
+   STATE_TIER_MEDIUM = 1,
+   STATE_TIER_HIGH   = 2
+};
+
+input ulong                     InpMagic                       = 260711;
+input ENUM_POSITION_SIZING_MODE InpPositionSizingMode          = POSITION_SIZE_FIXED_FRACTIONAL;
+input double                    InpRiskPercentPerTrade         = 0.50;
+input double                    InpFixedLots                   = 0.10;
+input double                    InpMinLot                      = 0.10;
+input double                    InpMaxLot                      = 50.0;
+input double                    InpLotStep                     = 0.10;
+input int                       InpSlippagePoints              = 30;
+input bool                      InpDebugPrint                  = false;
+
+input int                       InpMaxPositions                = 5;
+input bool                      InpUseStopLoss                 = true;
+input double                    InpStopFixedPrice              = 200.0;
+input bool                      InpUseBasketRiskCap            = true;
+input double                    InpBasketRiskMultiple          = 2.5;
+input int                       InpPostLossCooldownBars        = 25;
+
+input int                       InpA_EmaFast                   = 34;
+input int                       InpA_EmaSlow                   = 144;
+input int                       InpA_StdSpan                   = 55;
+input int                       InpA_ZSlopeN                   = 2;
+input double                    InpGapMinSlowMaSlope           = 0.29;
+input bool                      InpGapRequirePriorAboveFast    = true;
+
+input bool                      InpAllowSessionNewYork         = true;
+input bool                      InpAllowSessionLateUS          = true;
+input bool                      InpAllowSessionLondon          = false;
+input bool                      InpAllowSessionAsia            = false;
+
+input int                       InpStateRankMinGroupSize       = 30;
+input double                    InpStateWeightSlowSlope        = 0.28;
+input double                    InpStateWeightFastSlope        = 0.12;
+input double                    InpStateWeightZSlope          = 0.15;
+input double                    InpStateWeightZAccel          = 0.20;
+input double                    InpStateWeightShortVol         = 0.15;
+input double                    InpStateWeightGapDepth         = 0.10;
+input double                    InpStateTierHighMinScore       = 0.15;
+input double                    InpStateTierMediumMinScore     = -0.05;
+input double                    InpStateHighMultiplier         = 1.00;
+input double                    InpStateMediumMultiplier       = 0.75;
+input double                    InpStateLowMultiplier          = 0.50;
+
+input bool                      InpBasketExitOnlyIfProfitable  = true;
+input ENUM_STATE_TIER           InpProfitOnlyMinStateTier      = STATE_TIER_MEDIUM;
+
+CTrade trade;
+
+int g_ema_fast_handle = INVALID_HANDLE;
+int g_ema_slow_handle = INVALID_HANDLE;
+datetime g_last_bar_time = 0;
+bool g_initialized = false;
+int g_cooldown_remaining = 0;
+ulong g_last_processed_exit_deal = 0;
+
+bool IsNewBar()
+{
+   const datetime current_bar = iTime(_Symbol, _Period, 0);
+   if(current_bar == 0)
+      return false;
+
+   if(g_last_bar_time == 0)
+   {
+      g_last_bar_time = current_bar;
+      return false;
+   }
+
+   if(current_bar != g_last_bar_time)
+   {
+      g_last_bar_time = current_bar;
+      return true;
+   }
+
+   return false;
+}
+
+double ClampMin(const double value, const double minimum)
+{
+   return (value < minimum ? minimum : value);
+}
+
+bool IsFiniteNumber(const double value)
+{
+   return (value == value && value > -DBL_MAX && value < DBL_MAX);
+}
+
+string ToLowerText(const string value)
+{
+   string text = value;
+   StringToLower(text);
+   return text;
+}
+
+double NormalizePrice(const double price)
+{
+   return NormalizeDouble(price, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+}
+
+double StopLevelDistance()
+{
+   return (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+}
+
+double FloorToStep(const double value, const double step)
+{
+   if(step <= 0.0)
+      return value;
+   return MathFloor(value / step) * step;
+}
+
+double NormalizeVolumeToResearchConstraints(const double requested_volume)
+{
+   const double symbol_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   const double symbol_min = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   const double symbol_max = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+   const double step = MathMax(InpLotStep, symbol_step);
+   const double min_volume = MathMax(InpMinLot, symbol_min);
+   const double max_volume = MathMin(InpMaxLot, symbol_max);
+   if(requested_volume <= 0.0 || step <= 0.0 || min_volume <= 0.0 || max_volume <= 0.0 || min_volume > max_volume)
+      return 0.0;
+
+   double volume = FloorToStep(requested_volume, step);
+   if(volume < min_volume)
+      return 0.0;
+   if(volume > max_volume)
+      volume = FloorToStep(max_volume, step);
+
+   return NormalizeDouble(volume, 2);
+}
+
+double CalculateRiskSizedVolume(const double risk_money, const double entry_price, const double stop_price)
+{
+   const double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   const double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(risk_money <= 0.0 || tick_size <= 0.0 || tick_value <= 0.0)
+      return 0.0;
+
+   const double stop_distance = MathAbs(entry_price - stop_price);
+   if(stop_distance <= 0.0)
+      return 0.0;
+
+   const double money_per_lot = (stop_distance / tick_size) * tick_value;
+   if(money_per_lot <= 0.0)
+      return 0.0;
+
+   const double raw_volume = risk_money / money_per_lot;
+   return NormalizeVolumeToResearchConstraints(raw_volume);
+}
+
+double ResolveEntryVolume(const double entry_price, const double stop_price, const double size_multiplier)
+{
+   if(InpPositionSizingMode == POSITION_SIZE_FIXED_LOTS)
+      return NormalizeVolumeToResearchConstraints(InpFixedLots * MathMax(size_multiplier, 0.0));
+
+   const double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   const double risk_money = equity * InpRiskPercentPerTrade / 100.0 * MathMax(size_multiplier, 0.0);
+   return CalculateRiskSizedVolume(risk_money, entry_price, stop_price);
+}
+
+int CountPositionsByMagic(const string symbol, const long magic, const ENUM_POSITION_TYPE position_type)
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != symbol)
+         continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != magic)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != position_type)
+         continue;
+      ++count;
+   }
+   return count;
+}
+
+double BuildStopLossPrice(const double ask_price)
+{
+   if(!InpUseStopLoss || InpStopFixedPrice <= 0.0)
+      return 0.0;
+
+   double sl = ask_price - InpStopFixedPrice;
+   const double min_gap = StopLevelDistance();
+   if(sl >= ask_price - min_gap)
+      sl = ask_price - min_gap;
+
+   sl = NormalizePrice(sl);
+   if(sl <= 0.0 || sl >= ask_price)
+      return 0.0;
+
+   return sl;
+}
+
+double TradeRiskMoney(const double volume, const double entry_price, const double stop_price)
+{
+   if(volume <= 0.0 || stop_price <= 0.0 || stop_price >= entry_price)
+      return 0.0;
+
+   double pnl = 0.0;
+   if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, volume, entry_price, stop_price, pnl))
+      return 0.0;
+
+   return MathMax(0.0, -pnl);
+}
+
+double OpenRiskMoney()
+{
+   double risk = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != (long)InpMagic)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY)
+         continue;
+
+      const double volume = PositionGetDouble(POSITION_VOLUME);
+      const double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      const double sl = PositionGetDouble(POSITION_SL);
+      risk += TradeRiskMoney(volume, entry, sl);
+   }
+   return risk;
+}
+
+bool BasketRiskAllows(const double new_trade_risk)
+{
+   if(!InpUseBasketRiskCap || !InpUseStopLoss || InpBasketRiskMultiple <= 0.0)
+      return true;
+   if(new_trade_risk <= 0.0)
+      return false;
+
+   const double max_open_risk_money = new_trade_risk * InpBasketRiskMultiple;
+   const double open_risk_money = OpenRiskMoney();
+   return (open_risk_money + new_trade_risk <= max_open_risk_money + 1e-8);
+}
+
+bool CopyIndicatorSeries(const int handle, const int count, double &buffer[])
+{
+   ArrayResize(buffer, count);
+   ArraySetAsSeries(buffer, true);
+   return (CopyBuffer(handle, 0, 1, count, buffer) == count);
+}
+
+bool CopyRatesSeries(const int count, MqlRates &rates[])
+{
+   ArrayResize(rates, count);
+   ArraySetAsSeries(rates, true);
+   return (CopyRates(_Symbol, _Period, 1, count, rates) == count);
+}
+
+bool EwmStdSeries(const double &values[], const int count, const int span, double &out_std[])
+{
+   if(span < 2 || count < 2)
+      return false;
+
+   ArrayResize(out_std, count);
+   ArraySetAsSeries(out_std, true);
+
+   const double alpha = 2.0 / (span + 1.0);
+   double xr[];
+   double sr[];
+   ArrayResize(xr, count);
+   ArrayResize(sr, count);
+
+   for(int i = 0; i < count; ++i)
+      xr[i] = values[count - 1 - i];
+
+   double mean = xr[0];
+   double variance = 0.0;
+   sr[0] = 0.0;
+
+   for(int i = 1; i < count; ++i)
+   {
+      mean = alpha * xr[i] + (1.0 - alpha) * mean;
+      const double diff = xr[i] - mean;
+      variance = alpha * diff * diff + (1.0 - alpha) * variance;
+      if(variance < 0.0)
+         variance = 0.0;
+      sr[i] = MathSqrt(variance);
+   }
+
+   for(int i = 0; i < count; ++i)
+      out_std[i] = sr[count - 1 - i];
+
+   return true;
+}
+
+string SessionBucketFromTime(const datetime ts)
+{
+   MqlDateTime dt;
+   TimeToStruct(ts, dt);
+   if(dt.hour < 7)
+      return "Asia";
+   if(dt.hour < 12)
+      return "London";
+   if(dt.hour < 17)
+      return "New York";
+   return "Late US";
+}
+
+bool SessionAllowed(const string session_bucket)
+{
+   if(session_bucket == "New York")
+      return InpAllowSessionNewYork;
+   if(session_bucket == "Late US")
+      return InpAllowSessionLateUS;
+   if(session_bucket == "London")
+      return InpAllowSessionLondon;
+   if(session_bucket == "Asia")
+      return InpAllowSessionAsia;
+   return false;
+}
+
+int TierRankFromScore(const double state_score)
+{
+   if(state_score >= InpStateTierHighMinScore)
+      return (int)STATE_TIER_HIGH;
+   if(state_score >= InpStateTierMediumMinScore)
+      return (int)STATE_TIER_MEDIUM;
+   return (int)STATE_TIER_LOW;
+}
+
+string TierNameFromRank(const int rank)
+{
+   if(rank >= (int)STATE_TIER_HIGH)
+      return "high";
+   if(rank >= (int)STATE_TIER_MEDIUM)
+      return "medium";
+   return "low";
+}
+
+double TierMultiplierFromRank(const int rank)
+{
+   if(rank >= (int)STATE_TIER_HIGH)
+      return InpStateHighMultiplier;
+   if(rank >= (int)STATE_TIER_MEDIUM)
+      return InpStateMediumMultiplier;
+   return InpStateLowMultiplier;
+}
+
+int TierRankFromComment(const string comment)
+{
+   string text = ToLowerText(comment);
+   if(StringFind(text, "_high") >= 0)
+      return (int)STATE_TIER_HIGH;
+   if(StringFind(text, "_medium") >= 0)
+      return (int)STATE_TIER_MEDIUM;
+   return (int)STATE_TIER_LOW;
+}
+
+double MeanOfWindow(const double &values[], const int from_idx, const int to_idx)
+{
+   double total = 0.0;
+   int n = 0;
+   for(int i = from_idx; i <= to_idx; ++i)
+   {
+      total += values[i];
+      ++n;
+   }
+   return (n > 0 ? total / (double)n : 0.0);
+}
+
+double StdOfWindow(const double &values[], const int from_idx, const int to_idx)
+{
+   const int n = to_idx - from_idx + 1;
+   if(n <= 1)
+      return 0.0;
+   const double mean = MeanOfWindow(values, from_idx, to_idx);
+   double accum = 0.0;
+   for(int i = from_idx; i <= to_idx; ++i)
+   {
+      const double diff = values[i] - mean;
+      accum += diff * diff;
+   }
+   return MathSqrt(accum / (double)n);
+}
+
+double RankComponentAtCurrent(
+   const double &feature[],
+   const string &sessions[],
+   const int count,
+   const string current_session
+)
+{
+   int global_n = 0;
+   int global_le = 0;
+   int session_n = 0;
+   int session_le = 0;
+   const double current_value = feature[count - 1];
+   if(!IsFiniteNumber(current_value))
+      return 0.0;
+
+   for(int i = 0; i < count; ++i)
+   {
+      const double value = feature[i];
+      if(!IsFiniteNumber(value))
+         continue;
+      ++global_n;
+      if(value <= current_value)
+         ++global_le;
+      if(sessions[i] == current_session)
+      {
+         ++session_n;
+         if(value <= current_value)
+            ++session_le;
+      }
+   }
+
+   if(session_n >= InpStateRankMinGroupSize && session_n > 0)
+      return (2.0 * (double)session_le / (double)session_n) - 1.0;
+   if(global_n > 0)
+      return (2.0 * (double)global_le / (double)global_n) - 1.0;
+   return 0.0;
+}
+
+void RegisterLosingExitCooldown()
+{
+   g_cooldown_remaining = MathMax(g_cooldown_remaining, InpPostLossCooldownBars);
+}
+
+void RefreshCooldownFromClosedDeals()
+{
+   if(InpPostLossCooldownBars <= 0)
+      return;
+
+   const datetime now_time = TimeCurrent();
+   if(!HistorySelect(now_time - 14 * 24 * 60 * 60, now_time))
+      return;
+
+   const int total = HistoryDealsTotal();
+   ulong newest_processed = g_last_processed_exit_deal;
+   for(int i = total - 1; i >= 0; --i)
+   {
+      const ulong deal_ticket = HistoryDealGetTicket(i);
+      if(deal_ticket == 0)
+         continue;
+      if(deal_ticket <= g_last_processed_exit_deal)
+         break;
+
+      newest_processed = MathMax(newest_processed, deal_ticket);
+
+      if(HistoryDealGetString(deal_ticket, DEAL_SYMBOL) != _Symbol)
+         continue;
+      if((long)HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) != (long)InpMagic)
+         continue;
+
+      const long entry_type = HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+      if(entry_type != DEAL_ENTRY_OUT && entry_type != DEAL_ENTRY_OUT_BY)
+         continue;
+
+      const double profit =
+         HistoryDealGetDouble(deal_ticket, DEAL_PROFIT) +
+         HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION) +
+         HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
+      if(profit < 0.0)
+         RegisterLosingExitCooldown();
+   }
+
+   g_last_processed_exit_deal = newest_processed;
+}
+
+bool ComputeSignals(bool &enter_long, bool &exit_long, int &state_tier_rank, double &state_score_out)
+{
+   enter_long = false;
+   exit_long = false;
+   state_tier_rank = (int)STATE_TIER_LOW;
+   state_score_out = 0.0;
+
+   const int slope_n = MathMax(1, InpA_ZSlopeN);
+   const int bars_total = Bars(_Symbol, _Period);
+   const int count = MathMin(MathMax(bars_total - 10, 0), 5000);
+   if(count < MathMax(800, InpA_EmaSlow + InpA_StdSpan + 50))
+      return false;
+
+   MqlRates rates[];
+   double ema_fast_s[];
+   double ema_slow_s[];
+   if(!CopyRatesSeries(count, rates))
+      return false;
+   if(!CopyIndicatorSeries(g_ema_fast_handle, count, ema_fast_s))
+      return false;
+   if(!CopyIndicatorSeries(g_ema_slow_handle, count, ema_slow_s))
+      return false;
+
+   double spread_s[];
+   ArrayResize(spread_s, count);
+   ArraySetAsSeries(spread_s, true);
+   for(int i = 0; i < count; ++i)
+      spread_s[i] = ema_fast_s[i] - ema_slow_s[i];
+
+   double vol_s[];
+   if(!EwmStdSeries(spread_s, count, InpA_StdSpan, vol_s))
+      return false;
+
+   double close_c[], ema_fast_c[], ema_slow_c[], z_c[], slope_c[], accel_c[], fast_slope_c[], slow_slope_c[], gap_depth_c[], short_vol_c[];
+   bool trend_active_c[], in_gap_c[], armed_c[], exit_cross_c[];
+   double bars_since_cross_c[];
+   string sessions_c[];
+
+   ArrayResize(close_c, count);
+   ArrayResize(ema_fast_c, count);
+   ArrayResize(ema_slow_c, count);
+   ArrayResize(z_c, count);
+   ArrayResize(slope_c, count);
+   ArrayResize(accel_c, count);
+   ArrayResize(fast_slope_c, count);
+   ArrayResize(slow_slope_c, count);
+   ArrayResize(gap_depth_c, count);
+   ArrayResize(short_vol_c, count);
+   ArrayResize(trend_active_c, count);
+   ArrayResize(in_gap_c, count);
+   ArrayResize(armed_c, count);
+   ArrayResize(exit_cross_c, count);
+   ArrayResize(bars_since_cross_c, count);
+   ArrayResize(sessions_c, count);
+
+   for(int c = 0; c < count; ++c)
+   {
+      const int s = count - 1 - c;
+      close_c[c] = rates[s].close;
+      ema_fast_c[c] = ema_fast_s[s];
+      ema_slow_c[c] = ema_slow_s[s];
+      z_c[c] = spread_s[s] / ClampMin(vol_s[s], 1e-12);
+      if(!IsFiniteNumber(z_c[c]))
+         z_c[c] = 0.0;
+      sessions_c[c] = SessionBucketFromTime(rates[s].time);
+   }
+
+   for(int i = 0; i < count; ++i)
+   {
+      if(i >= slope_n)
+         slope_c[i] = (z_c[i] - z_c[i - slope_n]) / (double)slope_n;
+      else
+         slope_c[i] = 0.0;
+
+      if(i >= 1)
+      {
+         accel_c[i] = slope_c[i] - slope_c[i - 1];
+         fast_slope_c[i] = ema_fast_c[i] - ema_fast_c[i - 1];
+         slow_slope_c[i] = ema_slow_c[i] - ema_slow_c[i - 1];
+      }
+      else
+      {
+         accel_c[i] = 0.0;
+         fast_slope_c[i] = 0.0;
+         slow_slope_c[i] = 0.0;
+      }
+   }
+
+   double returns_c[];
+   ArrayResize(returns_c, count);
+   returns_c[0] = 0.0;
+   for(int i = 1; i < count; ++i)
+   {
+      returns_c[i] = (close_c[i - 1] != 0.0 ? (close_c[i] / close_c[i - 1]) - 1.0 : 0.0);
+      if(!IsFiniteNumber(returns_c[i]))
+         returns_c[i] = 0.0;
+   }
+   for(int i = 0; i < count; ++i)
+   {
+      if(i >= 11)
+         short_vol_c[i] = StdOfWindow(returns_c, i - 11, i);
+      else
+         short_vol_c[i] = 0.0;
+   }
+
+   bool active = false;
+   double bars_since_cross = 0.0;
+   for(int i = 0; i < count; ++i)
+   {
+      bool crossed_above = false;
+      bool crossed_below = false;
+      if(i > 0)
+      {
+         crossed_above = (close_c[i - 1] <= ema_slow_c[i - 1] && close_c[i] > ema_slow_c[i]);
+         crossed_below = (close_c[i - 1] >= ema_slow_c[i - 1] && close_c[i] < ema_slow_c[i]);
+      }
+      if(crossed_above)
+      {
+         active = true;
+         bars_since_cross = 0.0;
+      }
+      else if(crossed_below)
+      {
+         active = false;
+         bars_since_cross = 0.0;
+      }
+      else if(active)
+      {
+         bars_since_cross += 1.0;
+      }
+
+      trend_active_c[i] = active;
+      bars_since_cross_c[i] = (active ? bars_since_cross : EMPTY_VALUE);
+      const bool fast_above_slow = ema_fast_c[i] > ema_slow_c[i];
+      in_gap_c[i] = fast_above_slow && close_c[i] >= ema_slow_c[i] && close_c[i] <= ema_fast_c[i];
+      const double gap_width = ema_fast_c[i] - ema_slow_c[i];
+      gap_depth_c[i] = (gap_width != 0.0 ? (close_c[i] - ema_slow_c[i]) / gap_width : 0.0);
+      const bool prior_above_fast = (i > 0 ? close_c[i - 1] > ema_fast_c[i - 1] : false);
+      armed_c[i] = trend_active_c[i] && in_gap_c[i] && (!InpGapRequirePriorAboveFast || prior_above_fast) && slow_slope_c[i] >= InpGapMinSlowMaSlope;
+      exit_cross_c[i] = (i > 0 ? (close_c[i] <= ema_slow_c[i] && close_c[i - 1] > ema_slow_c[i - 1]) : false);
+   }
+
+   const int latest = count - 1;
+   const int prev = count - 2;
+   const string current_session = sessions_c[latest];
+
+   const double slow_component = RankComponentAtCurrent(slow_slope_c, sessions_c, count, current_session);
+   const double fast_component = RankComponentAtCurrent(fast_slope_c, sessions_c, count, current_session);
+   const double z_slope_component = RankComponentAtCurrent(slope_c, sessions_c, count, current_session);
+   const double z_accel_component = RankComponentAtCurrent(accel_c, sessions_c, count, current_session);
+   const double short_vol_component = RankComponentAtCurrent(short_vol_c, sessions_c, count, current_session);
+   const double gap_depth_component = RankComponentAtCurrent(gap_depth_c, sessions_c, count, current_session);
+
+   const double total_weight =
+      MathAbs(InpStateWeightSlowSlope) +
+      MathAbs(InpStateWeightFastSlope) +
+      MathAbs(InpStateWeightZSlope) +
+      MathAbs(InpStateWeightZAccel) +
+      MathAbs(InpStateWeightShortVol) +
+      MathAbs(InpStateWeightGapDepth);
+   if(total_weight <= 0.0)
+      return false;
+
+   state_score_out =
+      (slow_component * InpStateWeightSlowSlope +
+       fast_component * InpStateWeightFastSlope +
+       z_slope_component * InpStateWeightZSlope +
+       z_accel_component * InpStateWeightZAccel +
+       short_vol_component * InpStateWeightShortVol +
+       gap_depth_component * InpStateWeightGapDepth) / total_weight;
+
+   state_tier_rank = TierRankFromScore(state_score_out);
+
+   const bool armed_now = armed_c[latest] && SessionAllowed(current_session);
+   const bool armed_prev = (prev >= 0 ? armed_c[prev] : false);
+   if(!g_initialized)
+      enter_long = armed_now;
+   else
+      enter_long = armed_now && !armed_prev;
+   g_initialized = true;
+
+   exit_long = exit_cross_c[latest];
+
+   if(InpDebugPrint)
+      PrintFormat(
+         "gap armed=%d exit=%d tier=%s score=%.4f session=%s slowSlope=%.4f gapDepth=%.4f",
+         (int)enter_long,
+         (int)exit_long,
+         TierNameFromRank(state_tier_rank),
+         state_score_out,
+         current_session,
+         slow_slope_c[latest],
+         gap_depth_c[latest]
+      );
+
+   return true;
+}
+
+void ApplyExitLogic(const double bid_price)
+{
+   const int min_tier = (int)InpProfitOnlyMinStateTier;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != (long)InpMagic)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY)
+         continue;
+
+      const double entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      const string comment = PositionGetString(POSITION_COMMENT);
+      const int entry_tier = TierRankFromComment(comment);
+
+      bool should_close = true;
+      if(InpBasketExitOnlyIfProfitable && bid_price <= entry_price && entry_tier >= min_tier)
+         should_close = false;
+
+      if(!should_close)
+         continue;
+
+      const bool loss_close = bid_price <= entry_price;
+      if(!trade.PositionClose(ticket))
+      {
+         if(InpDebugPrint)
+            Print("Close failed ticket=", ticket, " retcode=", trade.ResultRetcode(), " err=", GetLastError());
+         continue;
+      }
+
+      if(loss_close)
+         RegisterLosingExitCooldown();
+      else
+         g_cooldown_remaining = 0;
+   }
+}
+
+int OnInit()
+{
+   trade.SetExpertMagicNumber((long)InpMagic);
+   trade.SetDeviationInPoints(InpSlippagePoints);
+
+   g_initialized = false;
+   g_last_bar_time = iTime(_Symbol, _Period, 0);
+   g_cooldown_remaining = 0;
+
+   g_ema_fast_handle = iMA(_Symbol, _Period, InpA_EmaFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema_slow_handle = iMA(_Symbol, _Period, InpA_EmaSlow, 0, MODE_EMA, PRICE_CLOSE);
+   if(g_ema_fast_handle == INVALID_HANDLE || g_ema_slow_handle == INVALID_HANDLE)
+   {
+      Print("Failed to create EMA handles");
+      return INIT_FAILED;
+   }
+
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   if(g_ema_fast_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_fast_handle);
+   if(g_ema_slow_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_slow_handle);
+}
+
+void OnTick()
+{
+   if(!IsNewBar())
+      return;
+
+   RefreshCooldownFromClosedDeals();
+
+   if(g_cooldown_remaining > 0)
+      --g_cooldown_remaining;
+
+   bool enter_long = false;
+   bool exit_long = false;
+   int state_tier_rank = (int)STATE_TIER_LOW;
+   double state_score = 0.0;
+   if(!ComputeSignals(enter_long, exit_long, state_tier_rank, state_score))
+      return;
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   if(exit_long)
+      ApplyExitLogic(tick.bid);
+
+   if(!enter_long)
+      return;
+   if(g_cooldown_remaining > 0)
+      return;
+
+   const int open_buys = CountPositionsByMagic(_Symbol, (long)InpMagic, POSITION_TYPE_BUY);
+   if(open_buys >= InpMaxPositions)
+      return;
+
+   double sl = 0.0;
+   if(InpUseStopLoss)
+   {
+      sl = BuildStopLossPrice(tick.ask);
+      if(sl <= 0.0)
+         return;
+   }
+
+   const double size_multiplier = TierMultiplierFromRank(state_tier_rank);
+   const double volume = ResolveEntryVolume(tick.ask, sl, size_multiplier);
+   if(volume <= 0.0)
+   {
+      if(InpDebugPrint)
+         Print("Volume resolution blocked entry");
+      return;
+   }
+
+   const double new_trade_risk = TradeRiskMoney(volume, tick.ask, sl);
+   if(InpUseBasketRiskCap && !BasketRiskAllows(new_trade_risk))
+   {
+      if(InpDebugPrint)
+         PrintFormat("Basket risk cap blocked entry. new_risk=%.2f open_risk=%.2f", new_trade_risk, OpenRiskMoney());
+      return;
+   }
+
+   const string tier_name = TierNameFromRank(state_tier_rank);
+   const string comment = StringFormat("US100GapSQ2MO_%s_s%.2f", tier_name, state_score);
+   if(!trade.Buy(volume, _Symbol, 0.0, sl, 0.0, comment))
+   {
+      if(InpDebugPrint)
+         Print("BUY failed retcode=", trade.ResultRetcode(), " err=", GetLastError());
+   }
+}
