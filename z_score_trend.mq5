@@ -1,913 +1,794 @@
-﻿//+------------------------------------------------------------------+
-//|                                                z_score_trend.mq5 |
-//+------------------------------------------------------------------+
-#property copyright "Joshua Grobler"
-#property version   "2.00"
 #property strict
-#property description "EMA baseline + RETZCUM z trigger + phase-change z_slope gate + shared ATR risk engine + runner trail/exit"
-
+#property version   "1.00"
+#property description "XAUUSD dual-zscore SQ1 winner: p17 basket exit with high-only profit deferral and state-quality sizing"
+#copyright JoshuaGrobler
 #include <Trade/Trade.mqh>
 
-enum ReturnMode
+enum ENUM_POSITION_SIZING_MODE
 {
-   RET_SIMPLE = 0,
-   RET_LOG    = 1
+   POSITION_SIZE_FIXED_FRACTIONAL = 0,
+   POSITION_SIZE_FIXED_LOTS       = 1
 };
 
-enum StallMode
+enum ENUM_STOP_MODE
 {
-   STALL_BY_HIGH  = 0,
-   STALL_BY_CLOSE = 1
+   STOP_FIXED_POINTS = 0,
+   STOP_ATR_BOUNDED  = 1
 };
 
-enum ENUM_RISK_PROFILE
+enum ENUM_STATE_TIER
 {
-   RP_FIXED_LOT              = 0,
-   RP_FIXED_FRACTIONAL       = 1,
-   RP_FIXED_FRACTIONAL_DD    = 2,
-   RP_FIXED_FRACTIONAL_HEAT  = 3,
-   RP_STEPPED_LOT            = 4
+   STATE_TIER_LOW    = 0,
+   STATE_TIER_MEDIUM = 1,
+   STATE_TIER_HIGH   = 2
 };
 
-// ---------- Trade ----------
-input ulong      InpMagic                 = 3452389;
-input int        InpSlippagePoints        = 5;
-input bool       InpPrintSizingDebug      = false;
+input ulong                     InpMagic                       = 260712;
+input ENUM_POSITION_SIZING_MODE InpPositionSizingMode          = POSITION_SIZE_FIXED_LOTS;
+input double                    InpRiskPercentPerTrade         = 0.50;
+input double                    InpFixedLots                   = 0.01;
+input double                    InpMinLot                      = 0.01;
+input double                    InpMaxLot                      = 100.0;
+input double                    InpLotStep                     = 0.01;
+input int                       InpSlippagePoints              = 20;
+input bool                      InpDebugPrint                  = false;
 
-// ---------- Baseline (EMA filter) ----------
-input int        InpEmaFast               = 21;
-input int        InpEmaSlow               = 89;
-input bool       InpRequireFastAboveSlow  = true;
-input bool       InpRequireCloseAboveSlow = true;
+input int                       InpRegimeLookback              = 500;
+input int                       InpPercentileLookback          = 500;
+input double                    InpExitPct                     = 17.0;
+input bool                      InpEdgeTrigger                 = true;
+input bool                      InpAllowFirstArmedEntry        = true;
+input int                       InpMaxPositions                = 5;
 
-// ---------- Trigger: RETZCUM3_W48_STD_K2 ----------
-input int        InpCumBars               = 18;
-input int        InpZWindow               = 48;
-input double     InpEntryZ                = 0.4;
-input ReturnMode InpReturnMode            = RET_SIMPLE;
+input int                       InpA_EmaFast                   = 34;
+input int                       InpA_EmaSlow                   = 144;
+input int                       InpA_StdSpan                   = 55;
+input double                    InpA_ZArm                      = 1.0;
+input int                       InpA_ZSlopeN                   = 3;
+input double                    InpA_Gamma                     = 0.07;
 
-// ---------- Phase change gate ----------
-input int        InpZSlopeN               = 4;
-input int        InpZSlopeGateN           = 3;
-input double     InpZSlopeMin             = 0.25;
-input double     InpGamma                 = 0.07;
+input bool                      InpUseStopLoss                 = true;
+input ENUM_STOP_MODE            InpStopMode                    = STOP_ATR_BOUNDED;
+input int                       InpStopLossPoints              = 1500;
+input int                       InpStopATRPeriod               = 100;
+input double                    InpStopATRMultiple             = 1.5;
+input double                    InpStopMinPrice                = 10.0;
+input double                    InpStopMaxPrice                = 25.0;
 
-// ---------- Runner policy ----------
-input int        InpConfirmBars           = 3;
-input int        InpStallBars             = 8;
-input StallMode  InpStallMode             = STALL_BY_HIGH;
+input bool                      InpUseBasketRiskCap            = true;
+input double                    InpBasketRiskMultiple          = 2.5;
 
-input double     InpArmR                  = 10.0;
-input double     InpBaseDistR             = 4.0;
-input double     InpMinDistR              = 2.0;
-input double     InpContractionStepR      = 2.0;
-input int        InpContractionCooldown   = 0;
-input bool       InpMonotonicTightening   = true;
+input double                    InpStateWeightZSlope           = 0.35;
+input double                    InpStateWeightZAccel           = 0.25;
+input double                    InpStateWeightShortVol         = 0.20;
+input double                    InpStateWeightTrendPersistence = 0.20;
+input double                    InpStateTierHighMinScore       = 0.15;
+input double                    InpStateTierMediumMinScore     = -0.05;
+input double                    InpStateHighMultiplier         = 1.50;
+input double                    InpStateMediumMultiplier       = 1.00;
+input double                    InpStateLowMultiplier          = 0.75;
 
-// ---------- Shared risk engine: stop construction ----------
-input bool       InpUseStop               = true;    // required for shared risk engine
-input int        InpAtrN                  = 14;
-input double     InpStopAtrMult           = 2;
-input double     InpMinStopPoints         = 10.0;   // safety min stop in points
-
-// ---------- Shared risk engine: profile ----------
-input ENUM_RISK_PROFILE InpRiskProfile    = RP_FIXED_FRACTIONAL;
-
-// common sizing inputs
-input bool       InpUseBalanceForSizing   = false;  // false = equity basis
-input double     InpFixedLot              = 0.10;   // RP_FIXED_LOT
-input double     InpRiskPct               = 0.5;  // 0.5% = 0.005
-
-// drawdown throttle
-input double     InpDD1Pct                = 0.05;   // 5%
-input double     InpDD2Pct                = 0.10;   // 10%
-input double     InpDDMult1               = 0.50;
-input double     InpDDMult2               = 0.25;
-
-// heat-cap profile
-input double     InpMaxOpenRiskPct        = 0.02;   // 2% of basis
-input bool       InpHeatAccountWide       = true;   // include all account positions
-
-// stepped lot profile
-input bool       InpUseEquitySteps        = true;
-input double     InpStartLot              = 0.01;
-input double     InpEquityStepUSD         = 200.0;
-input bool       InpScaleDown             = true;
-
-// optional starting anchor override
-input double     InpStartEquityOverride   = 0.0;
+input bool                      InpBasketExitOnlyIfProfitable  = true;
+input ENUM_STATE_TIER           InpProfitOnlyMinStateTier      = STATE_TIER_HIGH;
 
 CTrade trade;
 
-int ema_fast_h = INVALID_HANDLE;
-int ema_slow_h = INVALID_HANDLE;
-int atr_h      = INVALID_HANDLE;
-
-datetime g_lastBarTime   = 0;
-int      g_barCounter    = 0;
-
-// shared risk engine state
-double g_peakEquity      = 0.0;
-double g_anchorEquity    = 0.0;
-
-// trade/run state
-double g_entryPrice           = 0.0;
-double g_Rdist                = 0.0;
-double g_peakPrice            = 0.0;
-int    g_barsInTrade          = 0;
-int    g_barsSincePeak        = 0;
-
-bool   g_armed                = false;
-double g_trailDistR           = 0.0;
-int    g_lastContractionBar   = -100000;
-
-// -------------------------------------------------------
-// utilities
-// -------------------------------------------------------
-double Clamp(const double x, const double lo, const double hi)
-{
-   if(x < lo) return lo;
-   if(x > hi) return hi;
-   return x;
-}
+int g_ema_fast_handle = INVALID_HANDLE;
+int g_ema_slow_handle = INVALID_HANDLE;
+int g_atr_handle      = INVALID_HANDLE;
+datetime g_last_bar_time = 0;
+bool g_initialized = false;
 
 bool IsNewBar()
 {
-   datetime t = iTime(_Symbol, _Period, 0);
-   if(t == 0) return false;
+   const datetime current_bar = iTime(_Symbol, _Period, 0);
+   if(current_bar == 0)
+      return false;
 
-   if(t != g_lastBarTime)
+   if(g_last_bar_time == 0)
    {
-      g_lastBarTime = t;
+      g_last_bar_time = current_bar;
+      return false;
+   }
+
+   if(current_bar != g_last_bar_time)
+   {
+      g_last_bar_time = current_bar;
       return true;
    }
+
    return false;
 }
 
-double GetPoint()
+double ClampMin(const double value, const double minimum)
 {
-   return SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   return (value < minimum ? minimum : value);
 }
 
-double NormalizePrice(const double p)
+bool IsFiniteNumber(const double value)
 {
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   return NormalizeDouble(p, digits);
+   return (value == value && value > -DBL_MAX && value < DBL_MAX);
 }
 
-double MinLot()
+string ToLowerText(const string value)
 {
-   double v = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   return (v > 0.0 ? v : 0.01);
+   string text = value;
+   StringToLower(text);
+   return text;
 }
 
-double MaxLot()
+double NormalizePrice(const double price)
 {
-   double v = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   return (v > 0.0 ? v : 100.0);
+   return NormalizeDouble(price, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
 }
 
-double LotStep()
+double StopLevelDistance()
 {
-   double v = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   return (v > 0.0 ? v : 0.01);
+   return (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 }
 
-double NormalizeLotsClip(double vol)
+double FloorToStep(const double value, const double step)
 {
-   double mn   = MinLot();
-   double mx   = MaxLot();
-   double step = LotStep();
-
-   if(vol <= 0.0) return 0.0;
-
-   vol = Clamp(vol, mn, mx);
-   double k = MathFloor((vol - mn) / step + 1e-12);
-   double out = mn + k * step;
-
-   if(out < mn) out = mn;
-   if(out > mx) out = mx;
-
-   return NormalizeDouble(out, 2);
+   if(step <= 0.0)
+      return value;
+   return MathFloor(value / step) * step;
 }
 
-double NormalizeLotsFloorRisk(double vol)
+double NormalizeVolumeToResearchConstraints(const double requested_volume)
 {
-   double mn   = MinLot();
-   double mx   = MaxLot();
-   double step = LotStep();
+   const double symbol_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   const double symbol_min = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   const double symbol_max = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
 
-   if(vol < mn) return 0.0;
-   if(vol > mx) vol = mx;
+   const double step = MathMax(InpLotStep, symbol_step);
+   const double min_volume = MathMax(InpMinLot, symbol_min);
+   const double max_volume = MathMin(InpMaxLot, symbol_max);
+   if(requested_volume <= 0.0 || step <= 0.0 || min_volume <= 0.0 || max_volume <= 0.0 || min_volume > max_volume)
+      return 0.0;
 
-   double k = MathFloor((vol - mn) / step + 1e-12);
-   double out = mn + k * step;
+   double volume = FloorToStep(requested_volume, step);
+   if(volume < min_volume)
+      return 0.0;
+   if(volume > max_volume)
+      volume = FloorToStep(max_volume, step);
 
-   if(out < mn) return 0.0;
-   if(out > mx) out = mx;
-
-   return NormalizeDouble(out, 2);
+   return NormalizeDouble(volume, 2);
 }
 
-bool SelectOurPosition(ulong &ticket, int &dir, double &vol)
+double CalculateRiskSizedVolume(const double risk_money, const double entry_price, const double stop_price)
 {
-   ticket = 0;
-   dir    = 0;
-   vol    = 0.0;
+   const double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   const double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(risk_money <= 0.0 || tick_size <= 0.0 || tick_value <= 0.0)
+      return 0.0;
 
+   const double stop_distance = MathAbs(entry_price - stop_price);
+   if(stop_distance <= 0.0)
+      return 0.0;
+
+   const double money_per_lot = (stop_distance / tick_size) * tick_value;
+   if(money_per_lot <= 0.0)
+      return 0.0;
+
+   const double raw_volume = risk_money / money_per_lot;
+   return NormalizeVolumeToResearchConstraints(raw_volume);
+}
+
+double TierMultiplierFromRank(const int rank)
+{
+   if(rank >= (int)STATE_TIER_HIGH)
+      return InpStateHighMultiplier;
+   if(rank >= (int)STATE_TIER_MEDIUM)
+      return InpStateMediumMultiplier;
+   return InpStateLowMultiplier;
+}
+
+double ResolveEntryVolume(const double entry_price, const double stop_price, const double size_multiplier)
+{
+   if(InpPositionSizingMode == POSITION_SIZE_FIXED_LOTS)
+      return NormalizeVolumeToResearchConstraints(InpFixedLots * MathMax(size_multiplier, 0.0));
+
+   const double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   const double risk_money = equity * InpRiskPercentPerTrade / 100.0 * MathMax(size_multiplier, 0.0);
+   return CalculateRiskSizedVolume(risk_money, entry_price, stop_price);
+}
+
+int CountPositionsByMagic(const string symbol, const long magic, const ENUM_POSITION_TYPE position_type)
+{
+   int count = 0;
    for(int i = PositionsTotal() - 1; i >= 0; --i)
    {
-      ulong t = PositionGetTicket(i);
-      if(t == 0) continue;
-      if(!PositionSelectByTicket(t)) continue;
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != symbol)
+         continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != magic)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != position_type)
+         continue;
+      ++count;
+   }
+   return count;
+}
 
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+bool CopyIndicatorSeries(const int handle, const int count, double &buffer[])
+{
+   ArrayResize(buffer, count);
+   ArraySetAsSeries(buffer, true);
+   return (CopyBuffer(handle, 0, 1, count, buffer) == count);
+}
 
-      long type = PositionGetInteger(POSITION_TYPE);
-      dir = (type == POSITION_TYPE_BUY ? +1 : -1);
-      vol = PositionGetDouble(POSITION_VOLUME);
-      ticket = t;
-      return true;
+bool CopyRatesSeries(const int count, MqlRates &rates[])
+{
+   ArrayResize(rates, count);
+   ArraySetAsSeries(rates, true);
+   return (CopyRates(_Symbol, _Period, 1, count, rates) == count);
+}
+
+bool EwmStdSeries(const double &values[], const int count, const int span, double &out_std[])
+{
+   if(span < 2 || count < 2)
+      return false;
+
+   ArrayResize(out_std, count);
+   ArraySetAsSeries(out_std, true);
+
+   const double alpha = 2.0 / (span + 1.0);
+   double xr[];
+   double sr[];
+   ArrayResize(xr, count);
+   ArrayResize(sr, count);
+
+   for(int i = 0; i < count; ++i)
+      xr[i] = values[count - 1 - i];
+
+   double mean = xr[0];
+   double variance = 0.0;
+   sr[0] = 0.0;
+
+   for(int i = 1; i < count; ++i)
+   {
+      mean = alpha * xr[i] + (1.0 - alpha) * mean;
+      const double diff = xr[i] - mean;
+      variance = alpha * diff * diff + (1.0 - alpha) * variance;
+      if(variance < 0.0)
+         variance = 0.0;
+      sr[i] = MathSqrt(variance);
    }
 
-   return false;
+   for(int i = 0; i < count; ++i)
+      out_std[i] = sr[count - 1 - i];
+
+   return true;
 }
 
-bool HasPosition()
+int RegimeOf(const double vol, const double q33, const double q66)
 {
-   ulong ticket;
-   int dir;
-   double vol;
-   return SelectOurPosition(ticket, dir, vol);
+   if(vol <= q33)
+      return 0;
+   if(vol <= q66)
+      return 1;
+   return 2;
 }
 
-double GetPosSL()
+double QuantileFromSorted(const double &sorted_values[], const int count, const double q)
 {
-   ulong ticket;
-   int dir;
-   double vol;
-   if(!SelectOurPosition(ticket, dir, vol)) return 0.0;
-   return PositionGetDouble(POSITION_SL);
+   if(count <= 0)
+      return 0.0;
+   const int idx = (int)MathFloor(q * (count - 1));
+   return sorted_values[MathMax(0, MathMin(count - 1, idx))];
 }
 
-double GetPosOpenPrice()
+double CurrentATRStopDistance()
 {
-   ulong ticket;
-   int dir;
-   double vol;
-   if(!SelectOurPosition(ticket, dir, vol)) return 0.0;
-   return PositionGetDouble(POSITION_PRICE_OPEN);
+   double atr_vals[];
+   if(!CopyIndicatorSeries(g_atr_handle, 2, atr_vals))
+      return 0.0;
+
+   double distance = atr_vals[0] * InpStopATRMultiple;
+   if(distance <= 0.0)
+      return 0.0;
+
+   distance = MathMax(distance, InpStopMinPrice);
+   distance = MathMin(distance, InpStopMaxPrice);
+   return distance;
 }
 
-double GetATR(const int shift)
+double ResolveStopDistancePrice()
 {
-   if(atr_h == INVALID_HANDLE) return 0.0;
+   if(!InpUseStopLoss)
+      return 0.0;
 
-   double buf[1];
-   if(CopyBuffer(atr_h, 0, shift, 1, buf) != 1) return 0.0;
-   return buf[0];
+   if(InpStopMode == STOP_FIXED_POINTS)
+      return (double)InpStopLossPoints * _Point;
+
+   return CurrentATRStopDistance();
 }
 
-double GetEMA(const int handle, const int shift)
+double BuildStopLossPrice(const double ask_price)
 {
-   if(handle == INVALID_HANDLE) return 0.0;
+   const double stop_distance = ResolveStopDistancePrice();
+   if(stop_distance <= 0.0)
+      return 0.0;
 
-   double buf[1];
-   if(CopyBuffer(handle, 0, shift, 1, buf) != 1) return 0.0;
-   return buf[0];
+   double sl = ask_price - stop_distance;
+   const double min_gap = StopLevelDistance();
+   if(sl >= ask_price - min_gap)
+      sl = ask_price - min_gap;
+
+   sl = NormalizePrice(sl);
+   if(sl <= 0.0 || sl >= ask_price)
+      return 0.0;
+
+   return sl;
 }
 
-// -------------------------------------------------------
-// shared risk engine
-// -------------------------------------------------------
-double SizingBasis()
+double TradeRiskMoney(const double volume, const double entry_price, const double stop_price)
 {
-   return InpUseBalanceForSizing
-        ? AccountInfoDouble(ACCOUNT_BALANCE)
-        : AccountInfoDouble(ACCOUNT_EQUITY);
+   if(volume <= 0.0 || stop_price <= 0.0 || stop_price >= entry_price)
+      return 0.0;
+
+   double pnl = 0.0;
+   if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, volume, entry_price, stop_price, pnl))
+      return 0.0;
+
+   return MathMax(0.0, -pnl);
 }
 
-void UpdatePeakEquity()
+double OpenRiskMoney()
 {
-   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   if(g_peakEquity <= 0.0 || eq > g_peakEquity)
-      g_peakEquity = eq;
+   double risk = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != (long)InpMagic)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY)
+         continue;
+
+      const double volume = PositionGetDouble(POSITION_VOLUME);
+      const double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      const double sl = PositionGetDouble(POSITION_SL);
+      risk += TradeRiskMoney(volume, entry, sl);
+   }
+   return risk;
 }
 
-double CurrentDrawdownFrac()
+bool BasketRiskAllows(const double new_trade_risk)
 {
-   if(g_peakEquity <= 0.0) return 0.0;
+   if(!InpUseBasketRiskCap || !InpUseStopLoss || InpBasketRiskMultiple <= 0.0)
+      return true;
+   if(new_trade_risk <= 0.0)
+      return false;
 
-   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   double dd = (g_peakEquity - eq) / g_peakEquity;
-   return MathMax(0.0, dd);
+   const double max_open_risk_money = new_trade_risk * InpBasketRiskMultiple;
+   const double open_risk_money = OpenRiskMoney();
+   return (open_risk_money + new_trade_risk <= max_open_risk_money + 1e-8);
 }
 
-double DrawdownMultiplier()
+int TierRankFromScore(const double state_score)
 {
-   double dd = CurrentDrawdownFrac();
-   if(dd >= InpDD2Pct) return InpDDMult2;
-   if(dd >= InpDD1Pct) return InpDDMult1;
-   return 1.0;
+   if(state_score >= InpStateTierHighMinScore)
+      return (int)STATE_TIER_HIGH;
+   if(state_score >= InpStateTierMediumMinScore)
+      return (int)STATE_TIER_MEDIUM;
+   return (int)STATE_TIER_LOW;
 }
 
-double TickSizeValue()
+string TierNameFromRank(const int rank)
 {
-   double v = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(v <= 0.0) v = _Point;
-   return v;
+   if(rank >= (int)STATE_TIER_HIGH)
+      return "high";
+   if(rank >= (int)STATE_TIER_MEDIUM)
+      return "medium";
+   return "low";
 }
 
-double TickValueLoss()
+int TierRankFromComment(const string comment)
 {
-   double v = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE_LOSS);
-   if(v <= 0.0) v = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   if(v <= 0.0) v = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE_PROFIT);
-   return v;
+   string text = ToLowerText(comment);
+   if(StringFind(text, "_high") >= 0)
+      return (int)STATE_TIER_HIGH;
+   if(StringFind(text, "_medium") >= 0)
+      return (int)STATE_TIER_MEDIUM;
+   return (int)STATE_TIER_LOW;
 }
 
-double CashRiskPerLot(const double stop_dist_price)
+double MeanAndStdScore(const double current_value, const double &series[], const int count, double &std_out)
 {
-   if(stop_dist_price <= 0.0) return 0.0;
+   double sum = 0.0;
+   int n = 0;
+   for(int i = 0; i < count; ++i)
+   {
+      if(!IsFiniteNumber(series[i]))
+         continue;
+      sum += series[i];
+      ++n;
+   }
+   if(n <= 1)
+   {
+      std_out = 0.0;
+      return 0.0;
+   }
 
-   double tick_size  = TickSizeValue();
-   double tick_value = TickValueLoss();
+   const double mean = sum / (double)n;
+   double var_sum = 0.0;
+   for(int i = 0; i < count; ++i)
+   {
+      if(!IsFiniteNumber(series[i]))
+         continue;
+      const double diff = series[i] - mean;
+      var_sum += diff * diff;
+   }
+   const double std = MathSqrt(var_sum / (double)n);
+   std_out = std;
+   if(std <= 1e-12)
+      return 0.0;
 
-   if(tick_size <= 0.0 || tick_value <= 0.0) return 0.0;
-
-   return (stop_dist_price / tick_size) * tick_value;
+   double score = (current_value - mean) / std;
+   score = MathMax(-3.0, MathMin(3.0, score));
+   return score / 3.0;
 }
 
-double BrokerMinStopDistancePrice()
-{
-   long stops_level_pts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   if(stops_level_pts < 0) stops_level_pts = 0;
-   return (double)stops_level_pts * _Point;
-}
-
-double ComputeSteppedLotProfile()
-{
-   double base = NormalizeLotsClip(MathMax(InpStartLot, MinLot()));
-
-   if(!InpUseEquitySteps || InpEquityStepUSD <= 0.0)
-      return base;
-
-   double eq   = AccountInfoDouble(ACCOUNT_EQUITY);
-   double diff = eq - g_anchorEquity;
-
-   if(!InpScaleDown && diff < 0.0)
-      diff = 0.0;
-
-   double steps = MathFloor(diff / InpEquityStepUSD);
-   double vol   = base + steps * LotStep();
-
-   return NormalizeLotsClip(vol);
-}
-
-double CurrentOpenRiskDollars()
+double WeightedStateScore(
+   const double z_slope0,
+   const double z_accel0,
+   const double short_vol0,
+   const double trend_persistence0,
+   const double &z_slope[],
+   const double &z_accel[],
+   const double &short_vol[],
+   const double &trend_persistence[],
+   const int count
+)
 {
    double total = 0.0;
+   double total_abs_weight = 0.0;
+   double std_dummy = 0.0;
 
-   for(int i = PositionsTotal() - 1; i >= 0; --i)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-      if(!PositionSelectByTicket(ticket)) continue;
+   total += MeanAndStdScore(z_slope0, z_slope, count, std_dummy) * InpStateWeightZSlope;
+   total_abs_weight += MathAbs(InpStateWeightZSlope);
 
-      string sym = PositionGetString(POSITION_SYMBOL);
-      if(!InpHeatAccountWide && sym != _Symbol)
-         continue;
+   total += MeanAndStdScore(z_accel0, z_accel, count, std_dummy) * InpStateWeightZAccel;
+   total_abs_weight += MathAbs(InpStateWeightZAccel);
 
-      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl    = PositionGetDouble(POSITION_SL);
-      double vol   = PositionGetDouble(POSITION_VOLUME);
+   total += MeanAndStdScore(short_vol0, short_vol, count, std_dummy) * InpStateWeightShortVol;
+   total_abs_weight += MathAbs(InpStateWeightShortVol);
 
-      if(entry <= 0.0 || sl <= 0.0 || vol <= 0.0)
-         continue;
+   total += MeanAndStdScore(trend_persistence0, trend_persistence, count, std_dummy) * InpStateWeightTrendPersistence;
+   total_abs_weight += MathAbs(InpStateWeightTrendPersistence);
 
-      double dist = MathAbs(entry - sl);
-      double one_lot_risk = CashRiskPerLot(dist);
+   if(total_abs_weight <= 0.0)
+      return 0.0;
 
-      total += one_lot_risk * vol;
-   }
-
-   return total;
+   return MathMax(-1.0, MathMin(1.0, total / total_abs_weight));
 }
 
-bool BuildOrderPricesLong(double &entry_price, double &stop_price, double &stop_dist_price)
+bool ComputeSignals(bool &enter_long, bool &exit_long, int &state_tier_rank, double &state_score_out, double &z0, double &pct0)
 {
-   entry_price     = 0.0;
-   stop_price      = 0.0;
-   stop_dist_price = 0.0;
+   enter_long = false;
+   exit_long = false;
+   state_tier_rank = (int)STATE_TIER_LOW;
+   state_score_out = 0.0;
+   z0 = 0.0;
+   pct0 = 100.0;
 
-   if(!InpUseStop)
+   const int slope_n = MathMax(1, InpA_ZSlopeN);
+   const int need = MathMax(MathMax(InpRegimeLookback, InpPercentileLookback), 96) + InpA_EmaSlow + slope_n + 40;
+   if(Bars(_Symbol, _Period) < need + 10)
       return false;
 
-   MqlTick tick;
-   if(!SymbolInfoTick(_Symbol, tick))
+   MqlRates rates[];
+   double ema_fast[];
+   double ema_slow[];
+   if(!CopyRatesSeries(need, rates))
+      return false;
+   if(!CopyIndicatorSeries(g_ema_fast_handle, need, ema_fast))
+      return false;
+   if(!CopyIndicatorSeries(g_ema_slow_handle, need, ema_slow))
       return false;
 
-   double atr = GetATR(1);
-   if(atr <= 0.0)
+   double spread[];
+   ArrayResize(spread, need);
+   ArraySetAsSeries(spread, true);
+   for(int i = 0; i < need; ++i)
+      spread[i] = ema_fast[i] - ema_slow[i];
+
+   double vol_std[];
+   if(!EwmStdSeries(spread, need, InpA_StdSpan, vol_std))
       return false;
 
-   double min_dist = MathMax((double)InpMinStopPoints * _Point, BrokerMinStopDistancePrice());
-   stop_dist_price = MathMax(atr * InpStopAtrMult, min_dist);
+   double z[];
+   double z_slope[];
+   double z_accel[];
+   double short_vol[];
+   double trend_persistence[];
+   double close_series[];
+   ArrayResize(z, need);
+   ArrayResize(z_slope, need);
+   ArrayResize(z_accel, need);
+   ArrayResize(short_vol, need);
+   ArrayResize(trend_persistence, need);
+   ArrayResize(close_series, need);
+   ArraySetAsSeries(z, true);
+   ArraySetAsSeries(z_slope, true);
+   ArraySetAsSeries(z_accel, true);
+   ArraySetAsSeries(short_vol, true);
+   ArraySetAsSeries(trend_persistence, true);
+   ArraySetAsSeries(close_series, true);
 
-   entry_price = tick.ask;
-   if(entry_price <= 0.0) return false;
-
-   stop_price = entry_price - stop_dist_price;
-
-   entry_price = NormalizePrice(entry_price);
-   stop_price  = NormalizePrice(stop_price);
-
-   return (stop_price > 0.0);
-}
-
-double ComputeVolumeByRiskProfile(const double stop_dist_price, bool &allowed, double &target_risk_dollars)
-{
-   allowed = true;
-   target_risk_dollars = 0.0;
-
-   if(InpRiskProfile == RP_FIXED_LOT)
-      return NormalizeLotsClip(InpFixedLot);
-
-   if(InpRiskProfile == RP_STEPPED_LOT)
-      return ComputeSteppedLotProfile();
-
-   double basis = SizingBasis();
-   if(basis <= 0.0 || stop_dist_price <= 0.0)
+   for(int i = 0; i < need; ++i)
    {
-      allowed = false;
-      return 0.0;
+      close_series[i] = rates[i].close;
+      z[i] = spread[i] / ClampMin(vol_std[i], 1e-12);
    }
 
-   double one_lot_risk = CashRiskPerLot(stop_dist_price);
-   if(one_lot_risk <= 0.0)
+   for(int i = 0; i < need; ++i)
    {
-      allowed = false;
-      return 0.0;
+      if(i + slope_n < need)
+         z_slope[i] = (z[i] - z[i + slope_n]) / (double)slope_n;
+      else
+         z_slope[i] = 0.0;
    }
 
-   double risk_pct = InpRiskPct;
-
-   if(InpRiskProfile == RP_FIXED_FRACTIONAL_DD)
-      risk_pct *= DrawdownMultiplier();
-
-   target_risk_dollars = basis * risk_pct;
-
-   if(InpRiskProfile == RP_FIXED_FRACTIONAL_HEAT)
+   for(int i = 0; i < need; ++i)
    {
-      double open_risk = CurrentOpenRiskDollars();
-      double max_risk  = basis * InpMaxOpenRiskPct;
-      double remain    = max_risk - open_risk;
+      if(i + 1 < need)
+         z_accel[i] = z_slope[i] - z_slope[i + 1];
+      else
+         z_accel[i] = 0.0;
+   }
 
-      if(remain <= 0.0)
+   for(int i = 0; i < need; ++i)
+   {
+      if(i + 12 < need)
       {
-         allowed = false;
-         return 0.0;
-      }
-
-      if(target_risk_dollars > remain)
-         target_risk_dollars = remain;
-   }
-
-   if(target_risk_dollars <= 0.0)
-   {
-      allowed = false;
-      return 0.0;
-   }
-
-   double raw_lots = target_risk_dollars / one_lot_risk;
-   double lots     = NormalizeLotsFloorRisk(raw_lots);
-
-   if(lots <= 0.0)
-   {
-      allowed = false;
-      return 0.0;
-   }
-
-   return lots;
-}
-
-bool EnsurePositionStop()
-{
-   ulong ticket;
-   int dir;
-   double vol;
-   if(!SelectOurPosition(ticket, dir, vol)) return false;
-
-   double sl = PositionGetDouble(POSITION_SL);
-   if(sl > 0.0) return true;
-
-   if(!InpUseStop) return false;
-
-   double atr = GetATR(1);
-   if(atr <= 0.0) return false;
-
-   double dist = MathMax(atr * InpStopAtrMult,
-                  MathMax((double)InpMinStopPoints * _Point, BrokerMinStopDistancePrice()));
-
-   double priceOpen = PositionGetDouble(POSITION_PRICE_OPEN);
-   double newSL = (dir > 0) ? (priceOpen - dist) : (priceOpen + dist);
-   newSL = NormalizePrice(newSL);
-
-   return trade.PositionModify(ticket, newSL, 0.0);
-}
-
-// -------------------------------------------------------
-// signal computations
-// -------------------------------------------------------
-double CumReturn(const double &cl[], const int shift, const int cumBars, const ReturnMode mode)
-{
-   int i0 = shift;
-   int i1 = shift + cumBars;
-   if(i1 >= ArraySize(cl)) return 0.0;
-
-   double c0 = cl[i0];
-   double c1 = cl[i1];
-   if(c0 <= 0.0 || c1 <= 0.0) return 0.0;
-
-   if(mode == RET_LOG)
-      return MathLog(c0 / c1);
-
-   return (c0 / c1) - 1.0;
-}
-
-bool ZScoreCumReturn(const int shift, const int cumBars, const int win, const ReturnMode mode, double &z_out)
-{
-   int need = shift + cumBars + win + 5;
-
-   double cl[];
-   ArraySetAsSeries(cl, true);
-   if(CopyClose(_Symbol, _Period, 0, need, cl) < need) return false;
-
-   double r0 = CumReturn(cl, shift, cumBars, mode);
-
-   double sum = 0.0;
-   double sumsq = 0.0;
-
-   for(int i = 1; i <= win; i++)
-   {
-      double ri = CumReturn(cl, shift + i, cumBars, mode);
-      sum   += ri;
-      sumsq += ri * ri;
-   }
-
-   double mean = sum / win;
-   double var  = (sumsq / win) - (mean * mean);
-   if(var <= 1e-12)
-   {
-      z_out = 0.0;
-      return true;
-   }
-
-   z_out = (r0 - mean) / MathSqrt(var);
-   return true;
-}
-
-bool ZSlope(const int shift, const int zSlopeN, const int cumBars, const int win, const ReturnMode mode, double &slope_out)
-{
-   double z_now  = 0.0;
-   double z_past = 0.0;
-
-   if(!ZScoreCumReturn(shift,          cumBars, win, mode, z_now))  return false;
-   if(!ZScoreCumReturn(shift+zSlopeN,  cumBars, win, mode, z_past)) return false;
-
-   slope_out = (z_now - z_past) / (double)zSlopeN;
-   return true;
-}
-
-bool BaselineOK()
-{
-   double emaF = GetEMA(ema_fast_h, 1);
-   double emaS = GetEMA(ema_slow_h, 1);
-   double cl1  = iClose(_Symbol, _Period, 1);
-
-   if(InpRequireFastAboveSlow && !(emaF > emaS)) return false;
-   if(InpRequireCloseAboveSlow && !(cl1 > emaS)) return false;
-
-   return true;
-}
-
-bool PhaseChangeGateOK()
-{
-   double alpha = Clamp(InpGamma, 0.0, 1.0);
-   if(alpha <= 0.0) alpha = 1.0;
-
-   bool init = false;
-   double ewma = 0.0;
-
-   for(int k = InpZSlopeGateN; k >= 1; --k)
-   {
-      double s = 0.0;
-      if(!ZSlope(k, InpZSlopeN, InpCumBars, InpZWindow, InpReturnMode, s))
-         return false;
-
-      if(!init)
-      {
-         ewma = s;
-         init = true;
+         double sum = 0.0;
+         double sum_sq = 0.0;
+         int n = 0;
+         for(int k = i; k <= i + 11; ++k)
+         {
+            const double prev_close = close_series[k + 1];
+            if(prev_close == 0.0)
+               continue;
+            const double ret = (close_series[k] / prev_close) - 1.0;
+            sum += ret;
+            sum_sq += ret * ret;
+            ++n;
+         }
+         if(n > 1)
+         {
+            const double mean = sum / (double)n;
+            const double var = MathMax(0.0, (sum_sq / (double)n) - mean * mean);
+            short_vol[i] = MathSqrt(var);
+         }
+         else
+            short_vol[i] = 0.0;
       }
       else
+         short_vol[i] = 0.0;
+
+      if(i + 20 < need)
       {
-         ewma = alpha * s + (1.0 - alpha) * ewma;
+         const double direction = MathAbs(close_series[i] - close_series[i + 20]);
+         double path = 0.0;
+         for(int k = i; k < i + 20; ++k)
+            path += MathAbs(close_series[k] - close_series[k + 1]);
+         trend_persistence[i] = (path > 0.0 ? direction / path : 0.0);
       }
-
-      if(ewma <= InpZSlopeMin)
-         return false;
+      else
+         trend_persistence[i] = 0.0;
    }
 
-   return init;
-}
+   z0 = z[0];
+   if(1 + slope_n >= need)
+      return false;
 
-bool TriggerCrossUp(double &z_now_out)
-{
-   double z_now  = 0.0;
-   double z_prev = 0.0;
+   const double slope0 = z_slope[0];
+   const double slope_prev = z_slope[1];
+   const bool now_armed = (z[0] >= InpA_ZArm && slope0 >= InpA_Gamma);
+   const bool prev_armed = (z[1] >= InpA_ZArm && slope_prev >= InpA_Gamma);
 
-   if(!ZScoreCumReturn(1, InpCumBars, InpZWindow, InpReturnMode, z_now))  return false;
-   if(!ZScoreCumReturn(2, InpCumBars, InpZWindow, InpReturnMode, z_prev)) return false;
-
-   z_now_out = z_now;
-   return (z_prev <= InpEntryZ && z_now > InpEntryZ);
-}
-
-// -------------------------------------------------------
-// runner / exits
-// -------------------------------------------------------
-double GetFavorablePrice(const int shift)
-{
-   if(InpStallMode == STALL_BY_CLOSE)
-      return iClose(_Symbol, _Period, shift);
-
-   return iHigh(_Symbol, _Period, shift);
-}
-
-void ResetState()
-{
-   g_entryPrice         = 0.0;
-   g_Rdist              = 0.0;
-   g_peakPrice          = 0.0;
-   g_barsInTrade        = 0;
-   g_barsSincePeak      = 0;
-   g_armed              = false;
-   g_trailDistR         = 0.0;
-   g_lastContractionBar = -100000;
-}
-
-void SyncStateFromPosition()
-{
-   ulong ticket;
-   int dir;
-   double vol;
-
-   if(!SelectOurPosition(ticket, dir, vol))
-   {
-      ResetState();
-      return;
-   }
-
-   if(g_entryPrice != 0.0)
-      return;
-
-   g_entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-
-   double sl = PositionGetDouble(POSITION_SL);
-   if(sl > 0.0)
-   {
-      g_Rdist = MathAbs(g_entryPrice - sl);
-   }
+   if(!g_initialized && InpAllowFirstArmedEntry)
+      enter_long = now_armed;
    else
+      enter_long = (InpEdgeTrigger ? (now_armed && !prev_armed) : now_armed);
+
+   g_initialized = true;
+
+   const int regime_count = MathMin(InpRegimeLookback, need);
+   double vols[];
+   ArrayResize(vols, regime_count);
+   for(int i = 0; i < regime_count; ++i)
+      vols[i] = vol_std[i];
+   ArraySort(vols);
+
+   const double q33 = QuantileFromSorted(vols, regime_count, 0.33);
+   const double q66 = QuantileFromSorted(vols, regime_count, 0.66);
+   const int current_regime = RegimeOf(vol_std[0], q33, q66);
+
+   int n = 0;
+   int le = 0;
+   const int limit = MathMin(InpPercentileLookback, need);
+   for(int i = 0; i < limit; ++i)
    {
-      double atr = GetATR(1);
-      double dist = MathMax(atr * InpStopAtrMult,
-                     MathMax((double)InpMinStopPoints * _Point, BrokerMinStopDistancePrice()));
-      g_Rdist = dist;
+      if(RegimeOf(vol_std[i], q33, q66) != current_regime)
+         continue;
+      ++n;
+      if(z[i] <= z0)
+         ++le;
    }
 
-   g_peakPrice          = g_entryPrice;
-   g_barsInTrade        = 0;
-   g_barsSincePeak      = 0;
-   g_armed              = false;
-   g_trailDistR         = 0.0;
-   g_lastContractionBar = -100000;
-}
-
-void UpdateStallTracking()
-{
-   double fav = GetFavorablePrice(1);
-
-   if(fav > g_peakPrice + 1e-12)
+   if(n < 30)
    {
-      g_peakPrice = fav;
-      g_barsSincePeak = 0;
-   }
-   else
-   {
-      g_barsSincePeak++;
-   }
-}
-
-bool StallTriggered()
-{
-   return (InpStallBars > 0 && g_barsSincePeak >= InpStallBars);
-}
-
-void MaybeTightenTrail()
-{
-   if(!g_armed) return;
-   if(InpContractionStepR <= 0.0) return;
-   if(g_trailDistR <= InpMinDistR + 1e-12) return;
-
-   if((g_barCounter - g_lastContractionBar) < InpContractionCooldown)
-      return;
-
-   if(StallTriggered())
-   {
-      g_trailDistR = MathMax(InpMinDistR, g_trailDistR - InpContractionStepR);
-      g_lastContractionBar = g_barCounter;
-   }
-}
-
-void UpdateTrailingStop()
-{
-   if(!InpUseStop) return;
-   if(g_Rdist <= 0.0) return;
-
-   ulong ticket;
-   int dir;
-   double vol;
-   if(!SelectOurPosition(ticket, dir, vol)) return;
-
-   double mfe_r = (g_peakPrice - g_entryPrice) / g_Rdist;
-   if(!g_armed && mfe_r >= InpArmR)
-   {
-      g_armed = true;
-      g_trailDistR = InpBaseDistR;
+      n = limit;
+      le = 0;
+      for(int i = 0; i < limit; ++i)
+      {
+         if(z[i] <= z0)
+            ++le;
+      }
    }
 
-   if(!g_armed) return;
+   pct0 = (n > 0 ? 100.0 * (double)le / (double)n : 100.0);
+   exit_long = (pct0 <= InpExitPct);
 
-   double new_sl = g_peakPrice - g_trailDistR * g_Rdist;
-   double cur_sl = PositionGetDouble(POSITION_SL);
+   state_score_out = WeightedStateScore(
+      z_slope[0],
+      z_accel[0],
+      short_vol[0],
+      trend_persistence[0],
+      z_slope,
+      z_accel,
+      short_vol,
+      trend_persistence,
+      need
+   );
+   state_tier_rank = TierRankFromScore(state_score_out);
 
-   if(cur_sl <= 0.0)
-      cur_sl = g_entryPrice - g_Rdist;
-
-   if(InpMonotonicTightening)
-      new_sl = MathMax(new_sl, cur_sl);
-
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double max_sl = bid - MathMax(5.0 * GetPoint(), BrokerMinStopDistancePrice());
-   if(new_sl > max_sl)
-      new_sl = max_sl;
-
-   new_sl = NormalizePrice(new_sl);
-
-   if(new_sl > 0.0 && new_sl > cur_sl + 0.5 * _Point)
-      trade.PositionModify(ticket, new_sl, 0.0);
-}
-
-void MaybeExit()
-{
-   if(g_barsInTrade < InpConfirmBars) return;
-   if(!StallTriggered()) return;
-
-   ulong ticket;
-   int dir;
-   double vol;
-   if(!SelectOurPosition(ticket, dir, vol)) return;
-
-   if(trade.PositionClose(ticket, InpSlippagePoints))
-      ResetState();
-}
-
-void ManagePosition()
-{
-   EnsurePositionStop();
-
-   g_barsInTrade++;
-   UpdateStallTracking();
-   MaybeTightenTrail();
-   UpdateTrailingStop();
-   MaybeExit();
-}
-
-// -------------------------------------------------------
-// entry / orders
-// -------------------------------------------------------
-bool OpenLong()
-{
-   if(HasPosition())
-      return false;
-
-   double entry_price = 0.0;
-   double stop_price  = 0.0;
-   double stop_dist   = 0.0;
-
-   if(!BuildOrderPricesLong(entry_price, stop_price, stop_dist))
-      return false;
-
-   bool allowed = false;
-   double target_risk_dollars = 0.0;
-   double lots = ComputeVolumeByRiskProfile(stop_dist, allowed, target_risk_dollars);
-
-   if(!allowed || lots <= 0.0)
-   {
-      if(InpPrintSizingDebug)
-         PrintFormat("ENTRY BLOCKED | profile=%d | targetRisk=%.2f | stopDist=%.5f",
-                     (int)InpRiskProfile, target_risk_dollars, stop_dist);
-      return false;
-   }
-
-   bool ok = trade.Buy(lots, _Symbol, 0.0, stop_price, 0.0, "z_score_trend");
-   if(!ok)
-   {
-      if(InpPrintSizingDebug)
-         PrintFormat("ORDER FAILED | vol=%.2f | sl=%.5f | err=%d",
-                     lots, stop_price, GetLastError());
-      return false;
-   }
-
-   g_entryPrice = 0.0;
-   SyncStateFromPosition();
-
-   if(InpPrintSizingDebug)
-      PrintFormat("ENTRY OK | profile=%d | vol=%.2f | targetRisk=%.2f | stopDist=%.5f | DD=%.2f%% | openRisk=%.2f",
-                  (int)InpRiskProfile,
-                  lots,
-                  target_risk_dollars,
-                  stop_dist,
-                  100.0 * CurrentDrawdownFrac(),
-                  CurrentOpenRiskDollars());
+   if(InpDebugPrint)
+      PrintFormat(
+         "SQ1: z=%.5f slope=%.5f enter=%d exit=%d pct=%.2f tier=%s score=%.4f",
+         z0,
+         slope0,
+         (int)enter_long,
+         (int)exit_long,
+         pct0,
+         TierNameFromRank(state_tier_rank),
+         state_score_out
+      );
 
    return true;
 }
 
-void TryEnter()
+void ApplyExitLogic(const double bid_price)
 {
-   if(!BaselineOK()) return;
+   const int min_tier = (int)InpProfitOnlyMinStateTier;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != (long)InpMagic)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY)
+         continue;
 
-   double z_now = 0.0;
-   if(!TriggerCrossUp(z_now)) return;
+      const double entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      const string comment = PositionGetString(POSITION_COMMENT);
+      const int entry_tier = TierRankFromComment(comment);
 
-   if(!PhaseChangeGateOK()) return;
+      bool should_close = true;
+      if(InpBasketExitOnlyIfProfitable && bid_price <= entry_price && entry_tier >= min_tier)
+         should_close = false;
 
-   OpenLong();
+      if(!should_close)
+         continue;
+
+      if(!trade.PositionClose(ticket))
+      {
+         if(InpDebugPrint)
+            Print("Close failed ticket=", ticket, " retcode=", trade.ResultRetcode(), " err=", GetLastError());
+      }
+   }
 }
 
-// -------------------------------------------------------
-// lifecycle
-// -------------------------------------------------------
 int OnInit()
 {
-   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetExpertMagicNumber((long)InpMagic);
    trade.SetDeviationInPoints(InpSlippagePoints);
 
-   ema_fast_h = iMA(_Symbol, _Period, InpEmaFast, 0, MODE_EMA, PRICE_CLOSE);
-   ema_slow_h = iMA(_Symbol, _Period, InpEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
-   atr_h      = iATR(_Symbol, _Period, InpAtrN);
+   g_initialized = false;
+   g_last_bar_time = iTime(_Symbol, _Period, 0);
 
-   if(ema_fast_h == INVALID_HANDLE || ema_slow_h == INVALID_HANDLE || atr_h == INVALID_HANDLE)
+   g_ema_fast_handle = iMA(_Symbol, _Period, InpA_EmaFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema_slow_handle = iMA(_Symbol, _Period, InpA_EmaSlow, 0, MODE_EMA, PRICE_CLOSE);
+   g_atr_handle = iATR(_Symbol, _Period, InpStopATRPeriod);
+
+   if(g_ema_fast_handle == INVALID_HANDLE || g_ema_slow_handle == INVALID_HANDLE || g_atr_handle == INVALID_HANDLE)
+   {
+      Print("Failed to create indicator handles");
       return INIT_FAILED;
-
-   double start = (InpStartEquityOverride > 0.0)
-                ? InpStartEquityOverride
-                : AccountInfoDouble(ACCOUNT_EQUITY);
-
-   g_anchorEquity = start;
-   g_peakEquity   = start;
-
-   g_lastBarTime = iTime(_Symbol, _Period, 0);
-   g_barCounter  = 0;
-
-   ResetState();
-   SyncStateFromPosition();
+   }
 
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
-   if(ema_fast_h != INVALID_HANDLE) IndicatorRelease(ema_fast_h);
-   if(ema_slow_h != INVALID_HANDLE) IndicatorRelease(ema_slow_h);
-   if(atr_h      != INVALID_HANDLE) IndicatorRelease(atr_h);
+   if(g_ema_fast_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_fast_handle);
+   if(g_ema_slow_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_slow_handle);
+   if(g_atr_handle != INVALID_HANDLE)
+      IndicatorRelease(g_atr_handle);
 }
 
 void OnTick()
 {
-   UpdatePeakEquity();
+   if(!IsNewBar())
+      return;
 
-   if(!IsNewBar()) return;
+   bool enter_long = false;
+   bool exit_long = false;
+   int state_tier_rank = (int)STATE_TIER_LOW;
+   double state_score = 0.0;
+   double z0 = 0.0;
+   double pct0 = 100.0;
+   if(!ComputeSignals(enter_long, exit_long, state_tier_rank, state_score, z0, pct0))
+      return;
 
-   g_barCounter++;
-   SyncStateFromPosition();
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
 
-   if(HasPosition())
-      ManagePosition();
-   else
-      TryEnter();
+   if(exit_long)
+      ApplyExitLogic(tick.bid);
+
+   if(!enter_long)
+      return;
+
+   const int open_buys = CountPositionsByMagic(_Symbol, (long)InpMagic, POSITION_TYPE_BUY);
+   if(open_buys >= InpMaxPositions)
+      return;
+
+   double sl = 0.0;
+   if(InpUseStopLoss)
+   {
+      sl = BuildStopLossPrice(tick.ask);
+      if(sl <= 0.0)
+         return;
+   }
+
+   const double size_multiplier = TierMultiplierFromRank(state_tier_rank);
+   const double volume = ResolveEntryVolume(tick.ask, sl, size_multiplier);
+   if(volume <= 0.0)
+   {
+      if(InpDebugPrint)
+         Print("Volume resolution blocked entry");
+      return;
+   }
+
+   const double new_trade_risk = TradeRiskMoney(volume, tick.ask, sl);
+   if(InpUseBasketRiskCap && !BasketRiskAllows(new_trade_risk))
+   {
+      if(InpDebugPrint)
+         PrintFormat("Basket risk cap blocked entry. new_risk=%.2f open_risk=%.2f", new_trade_risk, OpenRiskMoney());
+      return;
+   }
+
+   const string tier_name = TierNameFromRank(state_tier_rank);
+   const string comment = StringFormat("XAUDZSQ1_%s_s%.2f", tier_name, state_score);
+   if(!trade.Buy(volume, _Symbol, 0.0, sl, 0.0, comment))
+   {
+      if(InpDebugPrint)
+         Print("BUY failed retcode=", trade.ResultRetcode(), " err=", GetLastError());
+   }
 }
