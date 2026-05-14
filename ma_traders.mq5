@@ -1,1351 +1,1778 @@
-﻿#property strict
+#property strict
+#property version   "1.20"
+#property description "Long-only XAUUSD regime strategy approximating the promoted MA native state-quality exit winner"
 
 #include <Trade/Trade.mqh>
 
-enum ENUM_RUN_MODE
-{
-  RUN_A = 0,
-  RUN_B = 1,
-  RUN_C = 2
-};
-
-enum ENUM_PULLVEL_WINDOW
-{
-  PULLVEL_W24 = 24,
-  PULLVEL_W48 = 48
-};
-
-input ENUM_RUN_MODE        InpRunMode              = RUN_C;
-
-// Execution model
-input bool                 InpNextOpenExecution    = true;   // entries/exits fire on bar close, execute next bar open
-
-// Lot scaling (your stepped equity sizing)
-input bool                 InpUseEquitySteps       = true;
-input double               InpStartLot             = 0.01;    // user-defined minimum lot to start at
-input double               InpEquityStepUSD        = 200.0;   // +1 volume step per $200
-input bool                 InpScaleDown            = true;    // reduce size if equity falls
-input ulong                InpMagicBase            = 345000;
-
-// Risk (all three)
-input int                  InpATR_N                = 14;
-input double               InpStopATRMult          = 1.;
-input double               InpMinStopPoints        = 10;      // safety min (points); set 0 to disable
-
-// Arm
-input double               InpArmMinPeakPnL_R      = 3.0;
-
-// Gates (HVOL + age)
-input int                  InpAgeBarsSinceMFE_GTE  = 12;
-input int                  InpVolRegimeWindow      = 96;
-
-// Gate (WHIP)
-input int                  InpWhipsawWindow        = 48;
-input double               InpWhipsawRatioThresh   = 3.0;     // proxy: sum(|ret|)/|net_move|
-
-// Detector params (A/C: return_z_shock_cum)
-input int                  InpRetZ_Window          = 448;
-input double               InpRetZ_K               = 2.0;
-input int                  InpRetZ_CumHorizon_A    = 2;
-input int                  InpRetZ_CumHorizon_C    = 3;
-
-// Detector params (B: pullback_vel_z)
-input ENUM_PULLVEL_WINDOW  InpPullVelWindow        = PULLVEL_W48;
-input double               InpPullVelK             = 3.0;
-
-// === Strategy params from your sheet ===
-
-// A/B entry: ma_p5
-input int                  InpA_FastN              = 20;
-input int                  InpA_MidN               = 50;
-input int                  InpA_SlowN              = 200;
-input int                  InpA_NRed               = 3;
-
-// C entry: ma_m1
-input int                  InpC_MidN               = 48;
-input int                  InpC_SlowN              = 144;
-input int                  InpC_VolSpan            = 48;      // EWMA std span
-input double               InpC_ZEntry             = 1.25;
-
-
-enum ENUM_RISK_PROFILE
-{
-  RP_FIXED_LOT = 0,
-  RP_FIXED_FRACTIONAL = 1,
-  RP_FIXED_FRACTIONAL_DD = 2,
-  RP_FIXED_FRACTIONAL_HEAT = 3,
-  RP_STEPPED_LOT = 4
-};
-
-input ENUM_RISK_PROFILE   InpRiskProfile          = RP_FIXED_FRACTIONAL;
-
-// Common risk-engine inputs
-input bool                InpUseBalanceForSizing  = false;   // false = equity basis
-input double              InpFixedLot             = 0.01;    // profile RP_FIXED_LOT
-input double              InpRiskPct              = 0.0025;  // 0.25% per trade for fractional profiles
-
-// Drawdown throttle profile
-input double              InpDD1Pct               = 0.05;    // 5%
-input double              InpDD2Pct               = 0.10;    // 10%
-input double              InpDDMult1              = 0.50;    // after DD1, risk *= 0.50
-input double              InpDDMult2              = 0.25;    // after DD2, risk *= 0.25
-
-// Heat-cap profile
-input double              InpMaxOpenRiskPct       = 0.1;    // max total open risk = 1% of basis
-input bool                InpHeatAccountWide      = true;    // true = include all account positions
-// -----------------------------
-double g_peakEquity   = 0.0;
-double g_anchorEquity = 0.0;
+input ulong   InpMagicNumber                        = 260605;
+input double  InpRiskPercentPerTrade                = 1.0;
+input double  InpMaxOpenRiskPercent                 = 10.0;
+input int     InpMaxConcurrentTrades                = 5;
+input int     InpCooldownBars                       = 5;
+input bool    InpContinuationRequireFreshHighAfterLoss = true;
+input int     InpRecentLosingSameLevelLookbackBars  = 50;
+input double  InpRecentLosingSameLevelDistanceATR   = 0.40;
+input int     InpBlockAfterRecentLosingSameLevelCount = 1;
+input int     InpHighestHighLookback                = 100;
+input int     InpEMAPeriod                          = 200;
+input int     InpEMAFastPeriod                      = 20;
+input int     InpEMAMidPeriod                       = 50;
+input int     InpATRPeriod                          = 14;
+input int     InpEfficiencyLookback                 = 20;
+input int     InpEMASlopeLookback                   = 10;
+input double  InpContinuationMinEfficiency          = 0.32;
+input double  InpStopDistancePrice                  = 10.0;   // 1R on XAUUSD
+input int     InpTimedTrailActivationBars           = 50;
+input double  InpTimedTrailR                        = 0.7;
+input double  InpBreakEvenTriggerR                  = 2.0;
+input double  InpTrendTrailAfter2RR                 = 2.5;
+input double  InpContinuationTakeProfitR            = 4.0;
+input double  InpContinuationBreakEvenOffsetR       = 0.25;
+input int     InpRegimeDeathFailedAddsThreshold     = 1;
+input int     InpRegimeDeathNoFreshHighBars         = 10;
+input double  InpRegimeDeathMaxEfficiency           = 0.32;
+input double  InpRegimeRearmMinEfficiency           = 0.40;
+input int     InpSurvivorFailedHighsThreshold       = 3;
+input double  InpSurvivorMinProfitR                 = 0.5;
+input double  InpSurvivorTightenOffsetR             = 1.0;
+input bool    InpSurvivorRequireLowerHighBreak      = true;
+input bool    InpSurvivorRequireFailedBreakout      = true;
+input double  InpSurvivorMinEMA20SlopeDecay         = 0.15;
+input bool    InpSurvivorMomentumRequireRegimeDead  = true;
+input int     InpStateZScoreLookback                = 100;
+input double  InpStateTwoScorePenaltyWeight         = 0.75;
+input double  InpStateHighMinScore                  = 0.15;
+input double  InpStateMediumMinScore                = -0.05;
+input double  InpStateHighRiskMultiplier            = 1.50;
+input double  InpStateMediumRiskMultiplier          = 1.00;
+input double  InpStateLowRiskMultiplier             = 0.75;
+input int     InpLowNoNewHighExitBars               = 3;
+input double  InpLowNoNewHighMinMFER                = 0.50;
+input int     InpLowNoNewHighMinBarsOpen            = 6;
+input double  InpMediumRetraceMinMFER               = 1.00;
+input double  InpMediumRetraceFrac                  = 0.33;
+input int     InpMediumRetraceMinBarsOpen           = 8;
+input int     InpMacdFast                           = 12;
+input int     InpMacdSlow                           = 26;
+input int     InpMacdSignal                         = 9;
+input int     InpMaxScanBars                        = 5000;
+input ulong   InpDeviationPoints                    = 30;
 
 CTrade trade;
+int g_ema_handle = INVALID_HANDLE;
+int g_ema_fast_handle = INVALID_HANDLE;
+int g_ema_mid_handle = INVALID_HANDLE;
+int g_atr_handle = INVALID_HANDLE;
+int g_osma_handle = INVALID_HANDLE;
+datetime g_last_bar_time = 0;
+datetime g_state_regime_start = 0;
+bool g_regime_continuation_dead = false;
+string g_regime_dead_reason = "";
+int g_regime_rearm_count = 0;
+datetime g_regime_last_rearm_bar = 0;
+string g_regime_last_rearm_reason = "";
 
-datetime g_lastBarTime = 0;
-
-// indicator handles
-int hEmaSlow200 = INVALID_HANDLE;
-int hEmaMid50   = INVALID_HANDLE;
-int hEmaFast20  = INVALID_HANDLE;
-
-int hEmaMid48   = INVALID_HANDLE;
-int hEmaSlow144 = INVALID_HANDLE;
-
-int hATR        = INVALID_HANDLE;
-
-// State for next-open execution
-int  g_pendingDir = 0;   // +1 long, -1 short
-bool g_pending    = false;
-
-// Edge-trigger memory (suppress consecutive duplicates)
-bool g_prevSigA = false;
-bool g_prevSigB = false;
-bool g_prevSigC_L = false;
-bool g_prevSigC_S = false;
-
-// Rolling stats for return_z_shock_cum (A horizon=2, C horizon=3)
-double g_retBufA[];
-double g_retBufC[];
-int    g_retIdxA = 0, g_retIdxC = 0;
-int    g_retCountA = 0, g_retCountC = 0;
-double g_retSumA = 0, g_retSumSqA = 0;
-double g_retSumC = 0, g_retSumSqC = 0;
-
-// Rolling stats for vol regime proxy (std96 vs std384)
-double g_r96Buf[];
-double g_r384Buf[];
-int    g_r96Idx=0, g_r384Idx=0;
-int    g_r96Count=0, g_r384Count=0;
-double g_r96Sum=0, g_r96SumSq=0;
-double g_r384Sum=0, g_r384SumSq=0;
-
-// Position run-state
-bool   g_armed = false;
-double g_entryPrice = 0.0;
-double g_Rdist = 0.0;
-double g_bestFavorable = 0.0; // highest high (long) / lowest low (short)
-int    g_barsSinceNewMFE = 0;
-
-// Pullback velocity rolling stats (only meaningful in-trade)
-double g_pvBuf[];
-int    g_pvIdx=0, g_pvCount=0;
-double g_pvSum=0, g_pvSumSq=0;
-
-// EWMA std state for C entry residual = close - EMA(mid)
-bool   g_ewmInit = false;
-double g_ewmMean = 0.0;
-double g_ewmVar  = 0.0;
-
-double Clamp(const double x, const double lo, const double hi)
+enum TradeKind
 {
-  if(x < lo) return lo;
-  if(x > hi) return hi;
-  return x;
+   TRADE_UNKNOWN = 0,
+   TRADE_FIRST   = 1,
+   TRADE_CONT    = 2
+};
+
+enum StateTier
+{
+   STATE_TIER_UNKNOWN = 0,
+   STATE_TIER_LOW     = 1,
+   STATE_TIER_MEDIUM  = 2,
+   STATE_TIER_HIGH    = 3
+};
+
+struct StateQualitySnapshot
+{
+   double    score;
+   double    continuation_score;
+   double    fragility_score;
+   StateTier tier;
+   double    risk_multiplier;
+};
+
+struct RegimeStats
+{
+   datetime regime_start;
+   datetime latest_entry_time;
+   int      entry_count;
+   int      failed_continuation_adds;
+};
+
+struct RegimePositionSnapshot
+{
+   ulong    position_id;
+   TradeKind kind;
+   datetime entry_time;
+   datetime exit_time;
+   double   entry_price;
+   double   realized_pnl;
+   bool     has_entry;
+};
+
+struct SurvivorStructureState
+{
+   int    failed_high_attempts;
+   bool   lower_high_confirmed;
+   bool   lower_low_confirmed;
+   bool   lower_high_then_swing_low_break;
+   bool   failed_breakout_flag;
+   double last_confirmed_swing_low;
+   double last_confirmed_swing_high;
+};
+
+string KindTag(const TradeKind kind)
+{
+   if(kind == TRADE_FIRST)
+      return "XAUF";
+   if(kind == TRADE_CONT)
+      return "XAUC";
+   return "XAU?";
 }
 
-int Sign(const double x)
+string TierName(const StateTier tier)
 {
-  if(x > 0.0) return  1;
-  if(x < 0.0) return -1;
-  return 0;
+   if(tier == STATE_TIER_HIGH)
+      return "high";
+   if(tier == STATE_TIER_MEDIUM)
+      return "medium";
+   if(tier == STATE_TIER_LOW)
+      return "low";
+   return "unknown";
+}
+
+TradeKind ParseTradeKind(const string comment)
+{
+   if(StringFind(comment, "XAUF|") == 0)
+      return TRADE_FIRST;
+   if(StringFind(comment, "XAUC|") == 0)
+      return TRADE_CONT;
+   return TRADE_UNKNOWN;
+}
+
+datetime ParseRegimeStart(const string comment)
+{
+   string parts[];
+   const int count = StringSplit(comment, '|', parts);
+   if(count < 2)
+      return 0;
+   if(StringLen(parts[1]) == 0)
+      return 0;
+   return (datetime)StringToInteger(parts[1]);
+}
+
+StateTier ParseStateTier(const string comment)
+{
+   string parts[];
+   const int count = StringSplit(comment, '|', parts);
+   if(count < 3)
+      return STATE_TIER_UNKNOWN;
+
+   string tier = parts[2];
+   StringToLower(tier);
+   if(tier == "high")
+      return STATE_TIER_HIGH;
+   if(tier == "medium")
+      return STATE_TIER_MEDIUM;
+   if(tier == "low")
+      return STATE_TIER_LOW;
+   return STATE_TIER_UNKNOWN;
+}
+
+bool IsHedgingAccount()
+{
+   return ((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+}
+
+double NormalizePrice(const double price)
+{
+   return NormalizeDouble(price, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+}
+
+double ClampValue(const double value, const double low, const double high)
+{
+   return MathMax(low, MathMin(high, value));
+}
+
+double NormalizeSymmetric(const double value, const double cap)
+{
+   if(cap <= 0.0)
+      return 0.0;
+   return ClampValue(value / cap, -1.0, 1.0);
+}
+
+double NormalizeWindow01ToSymmetric(const double value, const double low, const double high)
+{
+   if(high <= low)
+      return 0.0;
+   const double pct = ClampValue((value - low) / (high - low), 0.0, 1.0);
+   return pct * 2.0 - 1.0;
+}
+
+double StopLevelDistance()
+{
+   return (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 }
 
 bool IsNewBar()
 {
-  datetime t0 = (datetime)iTime(_Symbol, _Period, 0);
-  if(t0 != g_lastBarTime)
-  {
-    g_lastBarTime = t0;
-    return true;
-  }
-  return false;
+   const datetime current_bar = iTime(_Symbol, _Period, 0);
+   if(current_bar == 0)
+      return false;
+
+   if(g_last_bar_time == 0)
+   {
+      g_last_bar_time = current_bar;
+      return false;
+   }
+
+   if(current_bar != g_last_bar_time)
+   {
+      g_last_bar_time = current_bar;
+      return true;
+   }
+
+   return false;
 }
 
-bool GetMA(int handle, int shift, double &out)
+bool CopyIndicatorBuffer(const int handle, const int count, double &buffer[])
 {
-  double buf[1];
-  if(CopyBuffer(handle, 0, shift, 1, buf) != 1) return false;
-  out = buf[0];
-  return true;
+   ArrayResize(buffer, count);
+   if(CopyBuffer(handle, 0, 0, count, buffer) != count)
+      return false;
+   return true;
 }
 
-bool GetATR(int shift, double &out)
+double BufferValueAtShift(const double &buffer[], const int copied_count, const int shift)
 {
-  double buf[1];
-  if(CopyBuffer(hATR, 0, shift, 1, buf) != 1) return false;
-  out = buf[0];
-  return true;
+   const int index = copied_count - 1 - shift;
+   if(index < 0 || index >= copied_count)
+      return EMPTY_VALUE;
+   return buffer[index];
 }
 
-double StdFromSums(double sum, double sumsq, int n)
+bool IsConfirmedSwingHighAtShift(const int shift)
 {
-  if(n <= 1) return 0.0;
-  double mean = sum / n;
-  double var  = (sumsq / n) - (mean * mean);
-  if(var < 0.0) var = 0.0;
-  return MathSqrt(var);
+   if(shift < 2)
+      return false;
+   const double value = iHigh(_Symbol, _Period, shift);
+   return (value > iHigh(_Symbol, _Period, shift - 1)
+      && value > iHigh(_Symbol, _Period, shift - 2)
+      && value > iHigh(_Symbol, _Period, shift + 1)
+      && value > iHigh(_Symbol, _Period, shift + 2));
 }
 
-void RollPush(double &sum, double &sumsq, double &buf[], int &idx, int &count, int win, double x)
+bool IsConfirmedSwingLowAtShift(const int shift)
 {
-  if(ArraySize(buf) != win) ArrayResize(buf, win);
-
-  if(count < win)
-  {
-    buf[idx] = x;
-    sum += x;
-    sumsq += x*x;
-    idx = (idx + 1) % win;
-    count++;
-    return;
-  }
-
-  double old = buf[idx];
-  sum   += x - old;
-  sumsq += x*x - old*old;
-  buf[idx] = x;
-  idx = (idx + 1) % win;
+   if(shift < 2)
+      return false;
+   const double value = iLow(_Symbol, _Period, shift);
+   return (value < iLow(_Symbol, _Period, shift - 1)
+      && value < iLow(_Symbol, _Period, shift - 2)
+      && value < iLow(_Symbol, _Period, shift + 1)
+      && value < iLow(_Symbol, _Period, shift + 2));
 }
 
-double LotStep()
+double EMAFastSlopeAtShift(const int shift)
 {
-  double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-  if(step <= 0.0) step = 0.01;
-  return step;
-}
-
-double MinLot()
-{
-  double v = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-  if(v <= 0.0) v = 0.01;
-  return v;
-}
-
-double MaxLot()
-{
-  double v = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-  if(v <= 0.0) v = 100.0;
-  return v;
-}
-
-double RoundToStep(double vol)
-{
-  double step = LotStep();
-  double mn = MinLot();
-  double mx = MaxLot();
-  vol = Clamp(vol, mn, mx);
-  double k = MathFloor((vol - mn) / step + 0.5);
-  return Clamp(mn + k * step, mn, mx);
-}
-
-double ComputeVolume()
-{
-  double mn = MinLot();
-  double base = MathMax(InpStartLot, mn);
-  base = RoundToStep(base);
-
-  if(!InpUseEquitySteps) return base;
-
-  static bool inited = false;
-  static double anchorEquity = 0.0;
-  if(!inited)
-  {
-    anchorEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-    inited = true;
-  }
-
-  double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-  double diff = eq - anchorEquity;
-
-  if(!InpScaleDown && diff < 0.0) diff = 0.0;
-
-  double steps = (InpEquityStepUSD > 0.0) ? MathFloor(diff / InpEquityStepUSD) : 0.0;
-  double vol = base + steps * LotStep();
-  return RoundToStep(vol);
-}
-
-// --- Regime proxies (swap to exact harness versions if you paste them) ---
-
-// =====================
-// FIX: arrays by reference
-// =====================
-
-// =====================
-// Exact ATR + regimes (from your engine.py)
-// =====================
-
-double g_atr = 0.0;
-int    g_trCount = 0;      // number of TR observations processed
-bool   g_atrValid = false; // true once trCount >= atr_n
-
-// vol_regime[96] needs rolling quantiles on ATR with min_periods=96
-double g_atrRing96[];
-int    g_atrRingIdx96 = 0;
-int    g_atrRingCount96 = 0;
-string g_volRegime96 = ""; // "", "low","mid","high"
-
-// market_regime[48] needs rolling mean of flips with min_periods=48
-double g_flipSum48 = 0.0;
-double g_flipSumSq48 = 0.0; // unused but keeps RollPush signature simple
-double g_flipRing48[];
-int    g_flipIdx48 = 0;
-int    g_flipCount48 = 0;
-string g_marketRegime48 = ""; // "", "trend","neutral","whipsaw"
-
-double QuantileLinearSorted(const double &sorted[], int n, double p)
-{
-  if(n <= 0) return 0.0;
-  if(n == 1) return sorted[0];
-
-  if(p <= 0.0) return sorted[0];
-  if(p >= 1.0) return sorted[n-1];
-
-  double pos = (n - 1) * p;
-  int lo = (int)MathFloor(pos);
-  int hi = (int)MathCeil(pos);
-  if(hi >= n) hi = n - 1;
-  double frac = pos - lo;
-  return sorted[lo] + frac * (sorted[hi] - sorted[lo]);
-}
-
-void CopyRingToArray(const double &ring[], int win, int idx, int count, double &out[])
-{
-  ArrayResize(out, count);
-  // oldest element is at (idx - count) in ring coordinates
-  for(int i=0;i<count;i++)
-  {
-    int pos = idx - count + i;
-    while(pos < 0) pos += win;
-    pos %= win;
-    out[i] = ring[pos];
-  }
-}
-
-double RingQuantile(const double &ring[], int win, int idx, int count, double p)
-{
-  if(count <= 0) return 0.0;
-  double tmp[];
-  CopyRingToArray(ring, win, idx, count, tmp);
-  ArraySort(tmp);
-  return QuantileLinearSorted(tmp, count, p);
-}
-
-void AtrAndRegimeUpdateOnClosedBar(int atr_n, int vol_w, int mr_w)
-{
-  // === ATR update on bar 1 (just closed), exact TR definition ===
-  double hi1 = iHigh(_Symbol, _Period, 1);
-  double lo1 = iLow(_Symbol, _Period, 1);
-  double pc  = iClose(_Symbol, _Period, 2); // prev close of bar 1
-  if(pc <= 0.0) return;
-
-  double tr1 = MathMax(MathAbs(hi1 - lo1),
-               MathMax(MathAbs(hi1 - pc), MathAbs(lo1 - pc)));
-
-  double alpha = 1.0 / (double)MathMax(1, atr_n);
-  if(g_trCount == 0)
-    g_atr = tr1;
-  else
-    g_atr = alpha * tr1 + (1.0 - alpha) * g_atr;
-
-  g_trCount++;
-  g_atrValid = (g_trCount >= atr_n);
-
-  // === vol_regime[96] based on rolling quantiles of ATR, min_periods=96 ===
-  // Python uses pd.Series(atr_arr) which has NaNs until min_periods=atr_n.
-  // We mimic that by only pushing ATR once it's valid.
-  if(g_atrValid)
-  {
-    if(ArraySize(g_atrRing96) != vol_w) ArrayResize(g_atrRing96, vol_w);
-    g_atrRing96[g_atrRingIdx96] = g_atr;
-    g_atrRingIdx96 = (g_atrRingIdx96 + 1) % vol_w;
-    if(g_atrRingCount96 < vol_w) g_atrRingCount96++;
-
-    if(g_atrRingCount96 >= vol_w)
-    {
-      double q1 = RingQuantile(g_atrRing96, vol_w, g_atrRingIdx96, g_atrRingCount96, 1.0/3.0);
-      double q2 = RingQuantile(g_atrRing96, vol_w, g_atrRingIdx96, g_atrRingCount96, 2.0/3.0);
-
-      if(g_atr <= q1) g_volRegime96 = "low";
-      else if(g_atr <= q2) g_volRegime96 = "mid";
-      else g_volRegime96 = "high";
-    }
-    else
-    {
-      g_volRegime96 = ""; // min_periods not met
-    }
-  }
-  else
-  {
-    g_volRegime96 = "";
-  }
-
-  // === market_regime[48] based on flip rate of sign(ret), ret = close - prev_close ===
-  double c1 = iClose(_Symbol, _Period, 1);
-  double c2 = iClose(_Symbol, _Period, 2);
-  double c3 = iClose(_Symbol, _Period, 3);
-  if(c1 <= 0.0 || c2 <= 0.0 || c3 <= 0.0)
-    return;
-
-  double r1 = c1 - c2;
-  double r2 = c2 - c3;
-
-  int s1 = (r1 > 0.0) ? 1 : (r1 < 0.0 ? -1 : 0);
-  int s2 = (r2 > 0.0) ? 1 : (r2 < 0.0 ? -1 : 0);
-
-  double flip = ((s1 * s2) < 0) ? 1.0 : 0.0; // matches (s * roll(s,1) < 0)
-
-  // rolling mean with min_periods=mr_w
-  if(mr_w < 2) mr_w = 2;
-  // use RollPush just to maintain sum easily
-  if(ArraySize(g_flipRing48) != mr_w) ArrayResize(g_flipRing48, mr_w);
-
-  // manual rolling sum (simpler than RollPush because we only need sum)
-  if(g_flipCount48 < mr_w)
-  {
-    g_flipRing48[g_flipIdx48] = flip;
-    g_flipSum48 += flip;
-    g_flipIdx48 = (g_flipIdx48 + 1) % mr_w;
-    g_flipCount48++;
-  }
-  else
-  {
-    double old = g_flipRing48[g_flipIdx48];
-    g_flipSum48 += flip - old;
-    g_flipRing48[g_flipIdx48] = flip;
-    g_flipIdx48 = (g_flipIdx48 + 1) % mr_w;
-  }
-
-  if(g_flipCount48 >= mr_w)
-  {
-    double fr = g_flipSum48 / (double)mr_w;
-    if(fr >= 0.60) g_marketRegime48 = "whipsaw";
-    else if(fr <= 0.45) g_marketRegime48 = "trend";
-    else g_marketRegime48 = "neutral";
-  }
-  else
-  {
-    g_marketRegime48 = "";
-  }
-}
-
-// Replace your old gate functions with:
-bool Gate_HVOL_STALL8()
-{
-  if(g_barsSinceNewMFE < InpAgeBarsSinceMFE_GTE) return false;
-  return (g_volRegime96 == "high");
-}
-
-bool Gate_WHIP()
-{
-  return (g_marketRegime48 == "whipsaw");
-}
-
-// Replace any GetATR/iATR usage in stops with this:
-bool GetAtrForStop(double &atr_out)
-{
-  if(!g_atrValid) return false;
-  atr_out = g_atr;
-  return (atr_out > 0.0);
-}
-// --- Detectors ---
-
-double RetZ_ShockCum_Z(int cumHorizon, int rollWin, double &outCum)
-{
-  outCum = 0.0;
-  if(cumHorizon < 1) return 0.0;
-
-  double c0 = iClose(_Symbol, _Period, 1);
-  double cH = iClose(_Symbol, _Period, 1 + cumHorizon);
-  if(c0 <= 0.0 || cH <= 0.0) return 0.0;
-
-  // raw cumulative return
-  double cumRet = (c0 / cH) - 1.0;
-  outCum = cumRet;
-
-  // z uses rolling std of cumRet series (maintained externally)
-  return 0.0;
-}
-
-bool PositionIsOpen(int &dir, double &vol)
-{
-  if(!PositionSelect(_Symbol)) return false;
-  long type = PositionGetInteger(POSITION_TYPE);
-  dir = (type == POSITION_TYPE_BUY) ? +1 : -1;
-  vol = PositionGetDouble(POSITION_VOLUME);
-  return true;
-}
-
-void ResetRunState()
-{
-  g_armed = false;
-  g_entryPrice = 0.0;
-  g_Rdist = 0.0;
-  g_bestFavorable = 0.0;
-  g_barsSinceNewMFE = 0;
-
-  ArrayResize(g_pvBuf, 0);
-  g_pvIdx=0; g_pvCount=0; g_pvSum=0; g_pvSumSq=0;
-}
-
-
-
-void UpdateMFEStateOnClosedBar()
-{
-  int dir; double vol;
-  if(!PositionIsOpen(dir, vol)) return;
-
-  double hi = iHigh(_Symbol, _Period, 1);
-  double lo = iLow(_Symbol, _Period, 1);
-
-  bool improved = false;
-
-  if(dir > 0)
-  {
-    if(hi > g_bestFavorable) { g_bestFavorable = hi; improved = true; }
-  }
-  else
-  {
-    if(lo < g_bestFavorable || g_bestFavorable == g_entryPrice) { g_bestFavorable = lo; improved = true; }
-  }
-
-  if(improved) g_barsSinceNewMFE = 0;
-  else         g_barsSinceNewMFE++;
-
-  double mfeR = 0.0;
-  if(g_Rdist > 0.0)
-  {
-    mfeR = (dir > 0) ? (g_bestFavorable - g_entryPrice) / g_Rdist
-                     : (g_entryPrice - g_bestFavorable) / g_Rdist;
-  }
-  if(!g_armed && mfeR >= InpArmMinPeakPnL_R) g_armed = true;
-}
-
-
-bool ExitSignal_A_or_C(int dir, int cumH, double k, double stdCum)
-{
-  // For long: adverse negative shock => z <= -k
-  // For short: adverse positive shock => z >= +k
-  if(stdCum <= 0.0) return false;
-
-  double c0 = iClose(_Symbol, _Period, 1);
-  double cH = iClose(_Symbol, _Period, 1 + cumH);
-  if(c0 <= 0.0 || cH <= 0.0) return false;
-
-  double cumRet = (c0 / cH) - 1.0;
-  double z = cumRet / stdCum;
-
-  if(dir > 0) return (z <= -k);
-  else        return (z >=  k);
-}
-
-bool ExitSignal_B_PullVel(int dir, double k, double stdVel)
-{
-  if(stdVel <= 0.0) return false;
-  if(!g_armed) return false;
-
-  double c = iClose(_Symbol, _Period, 1);
-  if(c <= 0.0) return false;
-
-  double dd = 0.0;
-  if(dir > 0) dd = (g_bestFavorable - c);
-  else        dd = (c - g_bestFavorable);
-
-  double denom = (double)MathMax(1, g_barsSinceNewMFE);
-  double vel = dd / denom;
-  double z = vel / stdVel;
-
-  return (z >= k);
-}
-
-// --- Entries ---
-
-bool CandleIsGreen(int shift)
-{
-  double o = iOpen(_Symbol, _Period, shift);
-  double c = iClose(_Symbol, _Period, shift);
-  return (c > o);
-}
-
-bool CandleIsRed(int shift)
-{
-  double o = iOpen(_Symbol, _Period, shift);
-  double c = iClose(_Symbol, _Period, shift);
-  return (c < o);
-}
-
-bool Entry_A_or_B_Long()
-{
-  // trend_up = close > EMA(slow_n)
-  double emaSlow;
-  if(!GetMA(hEmaSlow200, 1, emaSlow)) return false;
-  double c1 = iClose(_Symbol, _Period, 1);
-  bool trend_up = (c1 > emaSlow);
-
-  // red_seq = red.shift(2).rolling(n_red).sum()==n_red
-  // with n_red=3 => bars 3,4,5 are red
-  bool red_seq = true;
-  for(int k=0;k<InpA_NRed;k++)
-    red_seq = red_seq && CandleIsRed(3 + k);
-
-  // long_cond = trend_up & red_seq & green & green.shift(1)
-  bool green1 = CandleIsGreen(1);
-  bool green2 = CandleIsGreen(2);
-
-  return (trend_up && red_seq && green1 && green2);
-}
-
-double EWMAStdUpdate(double x, int span)
-{
-  double alpha = 2.0 / (span + 1.0);
-
-  if(!g_ewmInit)
-  {
-    g_ewmInit = true;
-    g_ewmMean = x;
-    g_ewmVar  = 0.0;
-    return 0.0;
-  }
-
-  double prevMean = g_ewmMean;
-  g_ewmMean = alpha * x + (1.0 - alpha) * prevMean;
-
-  // EWMA variance (simple, stable)
-  double diff = x - g_ewmMean;
-  g_ewmVar = alpha * diff*diff + (1.0 - alpha) * g_ewmVar;
-
-  if(g_ewmVar < 0.0) g_ewmVar = 0.0;
-  return MathSqrt(g_ewmVar);
-}
-
-void UpdateEWMAResidualOnClosedBar()
-{
-  // residual = close - EMA(mid)
-  double emaMid;
-  if(!GetMA(hEmaMid48, 1, emaMid)) return;
-
-  double c1 = iClose(_Symbol, _Period, 1);
-  double resid = c1 - emaMid;
-  EWMAStdUpdate(resid, InpC_VolSpan);
-}
-
-bool Entry_C_LongShort(int &dirOut)
-{
-  double emaMid;
-  if(!GetMA(hEmaMid48, 1, emaMid)) return false;
-
-  double c1 = iClose(_Symbol, _Period, 1);
-  double resid = c1 - emaMid;
-
-  double std = MathSqrt(g_ewmVar);
-  if(std <= 0.0) return false;
-
-  double z = resid / std;
-
-  bool long_cond  = (z <= -InpC_ZEntry);
-  bool short_cond = (z >=  InpC_ZEntry);
-
-  // edge_trigger handled outside (separate prevs)
-  if(long_cond)  { dirOut = +1; return true; }
-  if(short_cond) { dirOut = -1; return true; }
-  return false;
-}
-
-// --- Orders ---
-
-bool EnsurePositionStop(int dir)
-{
-  if(!PositionSelect(_Symbol)) return false;
-
-  double sl = PositionGetDouble(POSITION_SL);
-  if(sl > 0.0) return true;
-
-  double atr;
-  if(!GetAtrForStop(atr)) return false;
-
-  double dist = atr * InpStopATRMult;
-  double minDist = MathMax((double)InpMinStopPoints * _Point, BrokerMinStopDistancePrice());
-  if(dist < minDist) dist = minDist;
-
-  double priceOpen = PositionGetDouble(POSITION_PRICE_OPEN);
-  double newSL = (dir > 0) ? (priceOpen - dist) : (priceOpen + dist);
-  newSL = NormalizeDouble(newSL, _Digits);
-
-  trade.SetExpertMagicNumber(InpMagicBase + (ulong)InpRunMode);
-  return trade.PositionModify(_Symbol, newSL, 0.0);
-}
-
-double SizingBasis()
-{
-  return InpUseBalanceForSizing
-       ? AccountInfoDouble(ACCOUNT_BALANCE)
-       : AccountInfoDouble(ACCOUNT_EQUITY);
-}
-
-void UpdatePeakEquity()
-{
-  double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-  if(g_peakEquity <= 0.0 || eq > g_peakEquity)
-    g_peakEquity = eq;
-}
-
-double CurrentDrawdownFrac()
-{
-  if(g_peakEquity <= 0.0) return 0.0;
-  double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-  double dd = (g_peakEquity - eq) / g_peakEquity;
-  return MathMax(0.0, dd);
-}
-
-double DrawdownMultiplier()
-{
-  double dd = CurrentDrawdownFrac();
-  if(dd >= InpDD2Pct) return InpDDMult2;
-  if(dd >= InpDD1Pct) return InpDDMult1;
-  return 1.0;
-}
-
-double TickSizeValue()
-{
-  double v = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-  if(v <= 0.0) v = _Point;
-  return v;
-}
-
-double TickValueLoss()
-{
-  double v = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE_LOSS);
-  if(v <= 0.0) v = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-  return v;
-}
-
-double CashRiskPerLot(double stop_dist_price)
-{
-  if(stop_dist_price <= 0.0) return 0.0;
-
-  double tick_size  = TickSizeValue();
-  double tick_value = TickValueLoss();
-
-  if(tick_size <= 0.0 || tick_value <= 0.0) return 0.0;
-
-  return (stop_dist_price / tick_size) * tick_value;
-}
-
-double BrokerMinStopDistancePrice()
-{
-  long stops_level_pts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-  if(stops_level_pts < 0) stops_level_pts = 0;
-  return (double)stops_level_pts * _Point;
-}
-
-double NormalizeLotsFloorRisk(double vol)
-{
-  double mn   = MinLot();
-  double mx   = MaxLot();
-  double step = LotStep();
-
-  if(vol < mn) return 0.0;
-  if(vol > mx) vol = mx;
-
-  double k = MathFloor((vol - mn) / step + 1e-12);
-  double out = mn + k * step;
-
-  if(out < mn) return 0.0;
-  if(out > mx) out = mx;
-
-  return out;
-}
-
-double NormalizeLotsClip(double vol)
-{
-  double mn   = MinLot();
-  double mx   = MaxLot();
-  double step = LotStep();
-
-  if(vol <= 0.0) return 0.0;
-
-  vol = Clamp(vol, mn, mx);
-  double k = MathFloor((vol - mn) / step + 1e-12);
-  double out = mn + k * step;
-
-  if(out < mn) out = mn;
-  if(out > mx) out = mx;
-
-  return out;
-}
-
-double ComputeSteppedLotProfile()
-{
-  double base = NormalizeLotsClip(MathMax(InpStartLot, MinLot()));
-
-  if(!InpUseEquitySteps || InpEquityStepUSD <= 0.0)
-    return base;
-
-  double eq   = AccountInfoDouble(ACCOUNT_EQUITY);
-  double diff = eq - g_anchorEquity;
-
-  if(!InpScaleDown && diff < 0.0)
-    diff = 0.0;
-
-  double steps = MathFloor(diff / InpEquityStepUSD);
-  double vol   = base + steps * LotStep();
-
-  return NormalizeLotsClip(vol);
-}
-
-double CurrentOpenRiskDollars()
-{
-  double total = 0.0;
-
-  for(int i = PositionsTotal() - 1; i >= 0; --i)
-  {
-    ulong ticket = PositionGetTicket(i);
-    if(ticket == 0) continue;
-    if(!PositionSelectByTicket(ticket)) continue;
-
-    string sym = PositionGetString(POSITION_SYMBOL);
-    if(!InpHeatAccountWide && sym != _Symbol)
-      continue;
-
-    double entry = PositionGetDouble(POSITION_PRICE_OPEN);
-    double sl    = PositionGetDouble(POSITION_SL);
-    double vol   = PositionGetDouble(POSITION_VOLUME);
-
-    if(entry <= 0.0 || sl <= 0.0 || vol <= 0.0)
-      continue;
-
-    double dist = MathAbs(entry - sl);
-    double one_lot_risk = CashRiskPerLot(dist);
-
-    total += one_lot_risk * vol;
-  }
-
-  return total;
-}
-
-bool BuildOrderPrices(int dir, double &entry_price, double &stop_price, double &stop_dist_price)
-{
-  MqlTick tick;
-  if(!SymbolInfoTick(_Symbol, tick))
-    return false;
-
-  double atr;
-  if(!GetAtrForStop(atr))
-    return false;
-
-  double min_dist = MathMax((double)InpMinStopPoints * _Point, BrokerMinStopDistancePrice());
-  stop_dist_price = MathMax(atr * InpStopATRMult, min_dist);
-
-  entry_price = (dir > 0) ? tick.ask : tick.bid;
-  if(entry_price <= 0.0) return false;
-
-  stop_price = (dir > 0)
-             ? (entry_price - stop_dist_price)
-             : (entry_price + stop_dist_price);
-
-  entry_price = NormalizeDouble(entry_price, _Digits);
-  stop_price  = NormalizeDouble(stop_price,  _Digits);
-
-  return true;
-}
-
-double ComputeVolumeByRiskProfile(double stop_dist_price, bool &allowed, double &target_risk_dollars)
-{
-  allowed = true;
-  target_risk_dollars = 0.0;
-
-  // Fixed lot
-  if(InpRiskProfile == RP_FIXED_LOT)
-    return NormalizeLotsClip(InpFixedLot);
-
-  // Stepped lot
-  if(InpRiskProfile == RP_STEPPED_LOT)
-    return ComputeSteppedLotProfile();
-
-  // Fractional profiles below
-  double basis = SizingBasis();
-  if(basis <= 0.0 || stop_dist_price <= 0.0)
-  {
-    allowed = false;
-    return 0.0;
-  }
-
-  double one_lot_risk = CashRiskPerLot(stop_dist_price);
-  if(one_lot_risk <= 0.0)
-  {
-    allowed = false;
-    return 0.0;
-  }
-
-  double risk_pct = InpRiskPct;
-
-  if(InpRiskProfile == RP_FIXED_FRACTIONAL_DD)
-    risk_pct *= DrawdownMultiplier();
-
-  target_risk_dollars = basis * risk_pct;
-
-  if(InpRiskProfile == RP_FIXED_FRACTIONAL_HEAT)
-  {
-    double open_risk = CurrentOpenRiskDollars();
-    double max_risk  = basis * InpMaxOpenRiskPct;
-    double remain    = max_risk - open_risk;
-
-    if(remain <= 0.0)
-    {
-      allowed = false;
+   const int need = shift + InpEMASlopeLookback + 2;
+   double ema_fast_vals[];
+   if(!CopyIndicatorBuffer(g_ema_fast_handle, need, ema_fast_vals))
       return 0.0;
-    }
 
-    if(target_risk_dollars > remain)
-      target_risk_dollars = remain;
-  }
-
-  if(target_risk_dollars <= 0.0)
-  {
-    allowed = false;
-    return 0.0;
-  }
-
-  double raw_lots = target_risk_dollars / one_lot_risk;
-  double lots     = NormalizeLotsFloorRisk(raw_lots);
-
-  if(lots <= 0.0)
-  {
-    allowed = false;
-    return 0.0;
-  }
-
-  return lots;
+   const double current = BufferValueAtShift(ema_fast_vals, need, shift);
+   const double prior   = BufferValueAtShift(ema_fast_vals, need, shift + InpEMASlopeLookback);
+   if(current == EMPTY_VALUE || prior == EMPTY_VALUE)
+      return 0.0;
+   return (current - prior) / (double)InpEMASlopeLookback;
 }
-//////
 
-
-bool ClosePosition()
+double EMAMidSlopeAtShift(const int shift)
 {
-  if(!PositionSelect(_Symbol)) return false;
-  trade.SetExpertMagicNumber(InpMagicBase + (ulong)InpRunMode);
-  bool ok = trade.PositionClose(_Symbol);
-  if(ok) ResetRunState();
-  return ok;
+   const int need = shift + InpEMASlopeLookback + 2;
+   double ema_mid_vals[];
+   if(!CopyIndicatorBuffer(g_ema_mid_handle, need, ema_mid_vals))
+      return 0.0;
+
+   const double current = BufferValueAtShift(ema_mid_vals, need, shift);
+   const double prior   = BufferValueAtShift(ema_mid_vals, need, shift + InpEMASlopeLookback);
+   if(current == EMPTY_VALUE || prior == EMPTY_VALUE)
+      return 0.0;
+   return (current - prior) / (double)InpEMASlopeLookback;
+}
+
+double EMAValueAtShift(const int handle, const int shift)
+{
+   const int need = shift + 2;
+   double values[];
+   if(!CopyIndicatorBuffer(handle, need, values))
+      return 0.0;
+   const double value = BufferValueAtShift(values, need, shift);
+   return (value == EMPTY_VALUE ? 0.0 : value);
+}
+
+double EMA200ValueAtShift(const int shift)
+{
+   return EMAValueAtShift(g_ema_handle, shift);
+}
+
+double EMAFastValueAtShift(const int shift)
+{
+   return EMAValueAtShift(g_ema_fast_handle, shift);
+}
+
+bool CurrentBullRegime(datetime &regime_start)
+{
+   regime_start = 0;
+
+   const int bars_total = Bars(_Symbol, _Period);
+   const int need = MathMin(bars_total, InpMaxScanBars + 5);
+   if(need < InpEMAPeriod + 5)
+      return false;
+
+   double ema[];
+   if(!CopyIndicatorBuffer(g_ema_handle, need, ema))
+      return false;
+
+   const double close1 = iClose(_Symbol, _Period, 1);
+   const double ema1   = BufferValueAtShift(ema, need, 1);
+   if(close1 <= ema1)
+      return false;
+
+   for(int shift = 1; shift < need - 1; ++shift)
+   {
+      const double c0 = iClose(_Symbol, _Period, shift);
+      const double c1 = iClose(_Symbol, _Period, shift + 1);
+      const double e0 = BufferValueAtShift(ema, need, shift);
+      const double e1 = BufferValueAtShift(ema, need, shift + 1);
+
+      if(c0 > e0 && c1 <= e1)
+      {
+         regime_start = iTime(_Symbol, _Period, shift);
+         return true;
+      }
+   }
+
+   regime_start = iTime(_Symbol, _Period, need - 1);
+   return true;
+}
+
+int FindSnapshotIndexByPositionId(const RegimePositionSnapshot &snapshots[], const ulong position_id)
+{
+   const int total = ArraySize(snapshots);
+   for(int i = 0; i < total; ++i)
+   {
+      if(snapshots[i].position_id == position_id)
+         return i;
+   }
+   return -1;
+}
+
+double HighestPriceBetween(const datetime from_time, const datetime to_time, const bool include_live_bid)
+{
+   if(from_time <= 0)
+      return SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   int from_shift = iBarShift(_Symbol, _Period, from_time, false);
+   int to_shift   = (to_time > 0 ? iBarShift(_Symbol, _Period, to_time, false) : 0);
+   if(from_shift < 0)
+      return SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(to_shift < 0)
+      to_shift = 0;
+   if(from_shift < to_shift)
+      from_shift = to_shift;
+
+   const int count = from_shift - to_shift + 1;
+   const int idx = iHighest(_Symbol, _Period, MODE_HIGH, count, to_shift);
+   double highest = (idx >= 0 ? iHigh(_Symbol, _Period, idx) : SymbolInfoDouble(_Symbol, SYMBOL_BID));
+
+   if(include_live_bid)
+   {
+      const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(bid > highest)
+         highest = bid;
+   }
+   return highest;
+}
+
+bool LoadRegimeStats(const datetime regime_start, RegimeStats &stats)
+{
+   stats.regime_start = regime_start;
+   stats.latest_entry_time = 0;
+   stats.entry_count = 0;
+   stats.failed_continuation_adds = 0;
+
+   if(regime_start <= 0)
+      return false;
+   if(!HistorySelect(regime_start, TimeCurrent()))
+      return false;
+
+   RegimePositionSnapshot snapshots[];
+   const int total = HistoryDealsTotal();
+   for(int i = 0; i < total; ++i)
+   {
+      const ulong deal_ticket = HistoryDealGetTicket(i);
+      if(deal_ticket == 0)
+         continue;
+
+      if((ulong)HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) != InpMagicNumber)
+         continue;
+      if(HistoryDealGetString(deal_ticket, DEAL_SYMBOL) != _Symbol)
+         continue;
+
+      const ulong position_id = (ulong)HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID);
+      const string comment = HistoryDealGetString(deal_ticket, DEAL_COMMENT);
+      const datetime comment_regime_start = ParseRegimeStart(comment);
+      const TradeKind kind = ParseTradeKind(comment);
+      if(comment_regime_start != regime_start || kind == TRADE_UNKNOWN)
+         continue;
+
+      const ENUM_DEAL_ENTRY entry_type = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+      const datetime deal_time = (datetime)HistoryDealGetInteger(deal_ticket, DEAL_TIME);
+      int idx = FindSnapshotIndexByPositionId(snapshots, position_id);
+      if(idx < 0)
+      {
+         idx = ArraySize(snapshots);
+         ArrayResize(snapshots, idx + 1);
+         snapshots[idx].position_id = position_id;
+         snapshots[idx].kind = kind;
+         snapshots[idx].entry_time = 0;
+         snapshots[idx].exit_time = 0;
+         snapshots[idx].entry_price = 0.0;
+         snapshots[idx].realized_pnl = 0.0;
+         snapshots[idx].has_entry = false;
+      }
+
+      if(entry_type == DEAL_ENTRY_IN && (ENUM_DEAL_TYPE)HistoryDealGetInteger(deal_ticket, DEAL_TYPE) == DEAL_TYPE_BUY)
+      {
+         ++stats.entry_count;
+         if(deal_time > stats.latest_entry_time)
+            stats.latest_entry_time = deal_time;
+
+         snapshots[idx].kind = kind;
+         snapshots[idx].entry_time = deal_time;
+         snapshots[idx].entry_price = HistoryDealGetDouble(deal_ticket, DEAL_PRICE);
+         snapshots[idx].has_entry = true;
+      }
+      else if(entry_type == DEAL_ENTRY_OUT)
+      {
+         snapshots[idx].realized_pnl += HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+         snapshots[idx].realized_pnl += HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
+         snapshots[idx].realized_pnl += HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
+         if(deal_time > snapshots[idx].exit_time)
+            snapshots[idx].exit_time = deal_time;
+      }
+   }
+
+   for(int i = 0; i < ArraySize(snapshots); ++i)
+   {
+      if(!snapshots[i].has_entry || snapshots[i].entry_price <= 0.0)
+         continue;
+
+      const double highest = HighestPriceBetween(
+         snapshots[i].entry_time,
+         snapshots[i].exit_time,
+         snapshots[i].exit_time == 0
+      );
+      const double mfe = highest - snapshots[i].entry_price;
+      if(snapshots[i].kind == TRADE_CONT && snapshots[i].exit_time > 0 && mfe < InpStopDistancePrice)
+         ++stats.failed_continuation_adds;
+   }
+
+   return true;
+}
+
+int StrategyPositionCount()
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY)
+         continue;
+      ++count;
+   }
+   return count;
+}
+
+double PositionRiskMoney(const ulong ticket)
+{
+   if(ticket == 0 || !PositionSelectByTicket(ticket))
+      return 0.0;
+
+   const double volume = PositionGetDouble(POSITION_VOLUME);
+   const double sl     = PositionGetDouble(POSITION_SL);
+   if(volume <= 0.0 || sl <= 0.0)
+      return 0.0;
+
+   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(sl >= bid)
+      return 0.0;
+
+   double pnl = 0.0;
+   if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, volume, bid, sl, pnl))
+      return 0.0;
+
+   return MathMax(0.0, -pnl);
+}
+
+double OpenRiskMoney()
+{
+   double risk = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY)
+         continue;
+      risk += PositionRiskMoney(ticket);
+   }
+   return risk;
+}
+
+double LossForVolume(const double volume, const double entry_price, const double stop_price)
+{
+   double pnl = 0.0;
+   if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, volume, entry_price, stop_price, pnl))
+      return 0.0;
+   return MathMax(0.0, -pnl);
+}
+
+double FloorToStep(const double value, const double step)
+{
+   if(step <= 0.0)
+      return value;
+   return MathFloor((value + 1e-12) / step) * step;
+}
+
+double CalculateVolume(const double risk_money, const double entry_price, const double stop_price)
+{
+   const double min_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   const double max_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   const double step       = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   const double loss_per_lot = LossForVolume(1.0, entry_price, stop_price);
+   if(loss_per_lot <= 0.0)
+      return 0.0;
+
+   double raw = risk_money / loss_per_lot;
+   if(raw <= 0.0)
+      return 0.0;
+
+   double volume = FloorToStep(raw, step);
+   if(volume < min_volume)
+      volume = min_volume;
+   if(volume > max_volume)
+      volume = FloorToStep(max_volume, step);
+
+   const int vol_digits = (step >= 1.0 ? 0 : (int)MathRound(-MathLog10(step)));
+   return NormalizeDouble(volume, vol_digits);
+}
+
+bool Fresh100BarHighAfterEntry(const datetime entry_time)
+{
+   const int entry_shift = iBarShift(_Symbol, _Period, entry_time, false);
+   if(entry_shift < InpCooldownBars)
+      return false;
+
+   for(int shift = entry_shift - 1; shift >= 1; --shift)
+   {
+      if(IsFresh100BarHighAtShift(shift))
+         return true;
+   }
+
+   return false;
+}
+
+bool EntryRearmed(const RegimeStats &stats)
+{
+   if(stats.latest_entry_time == 0)
+      return true;
+   return Fresh100BarHighAfterEntry(stats.latest_entry_time);
+}
+
+bool AnyFresh100BarHighSince(const datetime since_time)
+{
+   if(since_time <= 0)
+      return false;
+
+   const int since_shift = iBarShift(_Symbol, _Period, since_time, false);
+   if(since_shift < 2)
+      return false;
+
+   for(int shift = since_shift - 1; shift >= 1; --shift)
+   {
+      if(IsFresh100BarHighAtShift(shift))
+         return true;
+   }
+
+   return false;
+}
+
+bool ContinuationPassesRecentLossFilters(const double candidate_price)
+{
+   if(!InpContinuationRequireFreshHighAfterLoss
+      && (InpBlockAfterRecentLosingSameLevelCount <= 0
+      || InpRecentLosingSameLevelLookbackBars <= 0
+      || InpRecentLosingSameLevelDistanceATR <= 0.0))
+      return true;
+
+   if(!HistorySelect(0, TimeCurrent()))
+      return true;
+
+   const double atr = ATRAtShift(1);
+   const int lookback_bars = MathMax(1, InpRecentLosingSameLevelLookbackBars);
+   const double max_same_level_distance = atr * InpRecentLosingSameLevelDistanceATR;
+
+   RegimePositionSnapshot snapshots[];
+   const int total = HistoryDealsTotal();
+   for(int i = 0; i < total; ++i)
+   {
+      const ulong deal_ticket = HistoryDealGetTicket(i);
+      if(deal_ticket == 0)
+         continue;
+      if((ulong)HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) != InpMagicNumber)
+         continue;
+      if(HistoryDealGetString(deal_ticket, DEAL_SYMBOL) != _Symbol)
+         continue;
+
+      const ulong position_id = (ulong)HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID);
+      int idx = FindSnapshotIndexByPositionId(snapshots, position_id);
+      if(idx < 0)
+      {
+         idx = ArraySize(snapshots);
+         ArrayResize(snapshots, idx + 1);
+         snapshots[idx].position_id = position_id;
+         snapshots[idx].kind = TRADE_UNKNOWN;
+         snapshots[idx].entry_time = 0;
+         snapshots[idx].exit_time = 0;
+         snapshots[idx].entry_price = 0.0;
+         snapshots[idx].realized_pnl = 0.0;
+         snapshots[idx].has_entry = false;
+      }
+
+      const string comment = HistoryDealGetString(deal_ticket, DEAL_COMMENT);
+      const TradeKind kind = ParseTradeKind(comment);
+      if(kind != TRADE_UNKNOWN)
+         snapshots[idx].kind = kind;
+
+      const ENUM_DEAL_ENTRY entry_type = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+      const datetime deal_time = (datetime)HistoryDealGetInteger(deal_ticket, DEAL_TIME);
+      if(entry_type == DEAL_ENTRY_IN && (ENUM_DEAL_TYPE)HistoryDealGetInteger(deal_ticket, DEAL_TYPE) == DEAL_TYPE_BUY)
+      {
+         snapshots[idx].entry_time = deal_time;
+         snapshots[idx].entry_price = HistoryDealGetDouble(deal_ticket, DEAL_PRICE);
+         snapshots[idx].has_entry = true;
+      }
+      else if(entry_type == DEAL_ENTRY_OUT)
+      {
+         snapshots[idx].realized_pnl += HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+         snapshots[idx].realized_pnl += HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
+         snapshots[idx].realized_pnl += HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
+         if(deal_time > snapshots[idx].exit_time)
+            snapshots[idx].exit_time = deal_time;
+      }
+   }
+
+   datetime latest_loss_exit_time = 0;
+   int same_level_recent_losses = 0;
+   for(int i = 0; i < ArraySize(snapshots); ++i)
+   {
+      const RegimePositionSnapshot snapshot = snapshots[i];
+      if(!snapshot.has_entry || snapshot.exit_time <= 0 || snapshot.realized_pnl > 0.0)
+         continue;
+
+      if(snapshot.exit_time > latest_loss_exit_time)
+         latest_loss_exit_time = snapshot.exit_time;
+
+      if(snapshot.kind != TRADE_CONT)
+         continue;
+      if(atr <= 0.0 || InpBlockAfterRecentLosingSameLevelCount <= 0)
+         continue;
+
+      const int entry_shift = iBarShift(_Symbol, _Period, snapshot.entry_time, false);
+      if(entry_shift < 1 || entry_shift > lookback_bars)
+         continue;
+
+      if(MathAbs(candidate_price - snapshot.entry_price) <= max_same_level_distance + SymbolInfoDouble(_Symbol, SYMBOL_POINT))
+         ++same_level_recent_losses;
+   }
+
+   if(InpContinuationRequireFreshHighAfterLoss
+      && latest_loss_exit_time > 0
+      && !AnyFresh100BarHighSince(latest_loss_exit_time))
+      return false;
+
+   if(InpBlockAfterRecentLosingSameLevelCount > 0
+      && same_level_recent_losses >= InpBlockAfterRecentLosingSameLevelCount)
+      return false;
+
+   return true;
+}
+
+bool IsFresh100BarHighAtShift(const int shift)
+{
+   if(shift < 1)
+      return false;
+   const int idx = iHighest(_Symbol, _Period, MODE_HIGH, InpHighestHighLookback, shift + 1);
+   if(idx < 0)
+      return false;
+   return (iHigh(_Symbol, _Period, shift) > iHigh(_Symbol, _Period, idx));
+}
+
+int BarsSinceLastFreshHighInRegime(const datetime regime_start)
+{
+   for(int shift = 1; shift < InpMaxScanBars; ++shift)
+   {
+      const datetime bar_time = iTime(_Symbol, _Period, shift);
+      if(bar_time == 0 || bar_time < regime_start)
+         break;
+      if(IsFresh100BarHighAtShift(shift))
+         return shift - 1;
+   }
+
+   const int start_shift = iBarShift(_Symbol, _Period, regime_start, false);
+   if(start_shift < 1)
+      return InpMaxScanBars;
+   return MathMax(0, start_shift - 1);
+}
+
+double RollingEfficiencyAtShift(const int shift, const int lookback)
+{
+   if(shift < 1 || Bars(_Symbol, _Period) <= shift + lookback)
+      return 0.0;
+
+   const double current_close = iClose(_Symbol, _Period, shift);
+   const double prior_close   = iClose(_Symbol, _Period, shift + lookback);
+   double volatility = 0.0;
+   for(int i = 0; i < lookback; ++i)
+   {
+      const double c0 = iClose(_Symbol, _Period, shift + i);
+      const double c1 = iClose(_Symbol, _Period, shift + i + 1);
+      volatility += MathAbs(c0 - c1);
+   }
+
+   if(volatility <= 0.0)
+      return 0.0;
+   return MathAbs(current_close - prior_close) / volatility;
+}
+
+bool EntrySignal(double &reference_high)
+{
+   reference_high = 0.0;
+
+   if(Bars(_Symbol, _Period) < InpEMAPeriod + InpHighestHighLookback + 5)
+      return false;
+
+   double ema_vals[];
+   if(!CopyIndicatorBuffer(g_ema_handle, 3, ema_vals))
+      return false;
+
+   const double close1 = iClose(_Symbol, _Period, 1);
+   const double open1  = iOpen(_Symbol, _Period, 1);
+   const double close2 = iClose(_Symbol, _Period, 2);
+   const double open2  = iOpen(_Symbol, _Period, 2);
+   const double ema1   = BufferValueAtShift(ema_vals, 3, 1);
+
+   if(close1 <= ema1)
+      return false;
+   if(close1 <= open1 || close2 <= open2)
+      return false;
+
+   const int hh_idx = iHighest(_Symbol, _Period, MODE_HIGH, InpHighestHighLookback, 2);
+   if(hh_idx < 0)
+      return false;
+
+   reference_high = iHigh(_Symbol, _Period, hh_idx);
+   if(close1 >= reference_high)
+      return false;
+
+   return true;
+}
+
+bool IsConfirmedPeak(const double &osma[], const int copied_count, const int shift)
+{
+   const double v  = BufferValueAtShift(osma, copied_count, shift);
+   const double v1 = BufferValueAtShift(osma, copied_count, shift - 1);
+   const double v2 = BufferValueAtShift(osma, copied_count, shift - 2);
+   const double v3 = BufferValueAtShift(osma, copied_count, shift + 1);
+   const double v4 = BufferValueAtShift(osma, copied_count, shift + 2);
+
+   if(v == EMPTY_VALUE || v1 == EMPTY_VALUE || v2 == EMPTY_VALUE || v3 == EMPTY_VALUE || v4 == EMPTY_VALUE)
+      return false;
+
+   return (v > 0.0 && v > v1 && v > v2 && v > v3 && v > v4);
+}
+
+bool BearishMacdDoublePeakSinceEntry(const datetime entry_time)
+{
+   const int entry_shift = iBarShift(_Symbol, _Period, entry_time, false);
+   if(entry_shift < 6)
+      return false;
+
+   const int count = entry_shift + 3;
+   double osma[];
+   if(!CopyIndicatorBuffer(g_osma_handle, count, osma))
+      return false;
+
+   double prev_peak = EMPTY_VALUE;
+   double last_peak = EMPTY_VALUE;
+
+   for(int shift = entry_shift - 1; shift >= 2; --shift)
+   {
+      if(!IsConfirmedPeak(osma, count, shift))
+         continue;
+
+      prev_peak = last_peak;
+      last_peak = BufferValueAtShift(osma, count, shift);
+   }
+
+   if(prev_peak == EMPTY_VALUE || last_peak == EMPTY_VALUE)
+      return false;
+
+   return (last_peak < prev_peak);
+}
+
+int BarsInTrade(const datetime entry_time)
+{
+   const int shift = iBarShift(_Symbol, _Period, entry_time, false);
+   return MathMax(0, shift);
+}
+
+double HighestSinceEntry(const datetime entry_time)
+{
+   return HighestPriceBetween(entry_time, 0, true);
+}
+
+double HighestSinceEntryClosedBars(const datetime entry_time)
+{
+   const int entry_shift = iBarShift(_Symbol, _Period, entry_time, false);
+   if(entry_shift < 1)
+      return SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   const int idx = iHighest(_Symbol, _Period, MODE_HIGH, entry_shift, 1);
+   if(idx < 0)
+      return SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   return iHigh(_Symbol, _Period, idx);
+}
+
+double ATRAtShift(const int shift)
+{
+   const int need = shift + 2;
+   double atr_vals[];
+   if(!CopyIndicatorBuffer(g_atr_handle, need, atr_vals))
+      return 0.0;
+   const double atr = BufferValueAtShift(atr_vals, need, shift);
+   if(atr == EMPTY_VALUE)
+      return 0.0;
+   return atr;
+}
+
+string SessionBucketOfTime(const datetime bar_time)
+{
+   MqlDateTime parts;
+   TimeToStruct(bar_time, parts);
+   if(parts.hour < 8)
+      return "Asia";
+   if(parts.hour < 13)
+      return "London";
+   if(parts.hour < 22)
+      return "NewYork";
+   return "LateUS";
+}
+
+double TrendPersistenceAtShift(const int shift, const int lookback)
+{
+   if(shift < 1 || Bars(_Symbol, _Period) <= shift + lookback)
+      return 0.0;
+
+   const double direction = MathAbs(iClose(_Symbol, _Period, shift) - iClose(_Symbol, _Period, shift + lookback));
+   double path = 0.0;
+   for(int i = shift; i < shift + lookback; ++i)
+      path += MathAbs(iClose(_Symbol, _Period, i) - iClose(_Symbol, _Period, i + 1));
+
+   if(path <= 0.0)
+      return 0.0;
+   return direction / path;
+}
+
+double FreshHighFrequencyAtShift(const int shift, const int lookback)
+{
+   int hits = 0;
+   int n = 0;
+   for(int i = shift; i < shift + lookback && i < Bars(_Symbol, _Period) - 2; ++i)
+   {
+      if(IsFresh100BarHighAtShift(i))
+         ++hits;
+      ++n;
+   }
+   if(n <= 0)
+      return 0.0;
+   return (double)hits / (double)n;
+}
+
+double FractionClosesAboveEMAFastAtShift(const int shift, const int lookback)
+{
+   const int need = shift + lookback + 2;
+   double ema_fast_vals[];
+   if(!CopyIndicatorBuffer(g_ema_fast_handle, need, ema_fast_vals))
+      return 0.0;
+
+   int hits = 0;
+   int n = 0;
+   for(int i = shift; i < shift + lookback && i < Bars(_Symbol, _Period) - 1; ++i)
+   {
+      const double ema_fast = BufferValueAtShift(ema_fast_vals, need, i);
+      if(ema_fast == EMPTY_VALUE)
+         continue;
+      if(iClose(_Symbol, _Period, i) > ema_fast)
+         ++hits;
+      ++n;
+   }
+   if(n <= 0)
+      return 0.0;
+   return (double)hits / (double)n;
+}
+
+double DistanceAboveEMA200ZAtShift(const int shift)
+{
+   const int lookback = MathMax(20, InpStateZScoreLookback);
+   const int need = shift + lookback + 2;
+   if(Bars(_Symbol, _Period) <= shift + lookback)
+      return 0.0;
+
+   double ema_vals[];
+   if(!CopyIndicatorBuffer(g_ema_handle, need, ema_vals))
+      return 0.0;
+
+   double current = 0.0;
+   double sum = 0.0;
+   double sum_sq = 0.0;
+   int n = 0;
+   for(int i = shift; i < shift + lookback; ++i)
+   {
+      const double ema_value = BufferValueAtShift(ema_vals, need, i);
+      if(ema_value == EMPTY_VALUE)
+         continue;
+      const double distance = iClose(_Symbol, _Period, i) - ema_value;
+      if(i == shift)
+         current = distance;
+      sum += distance;
+      sum_sq += distance * distance;
+      ++n;
+   }
+   if(n < 2)
+      return 0.0;
+
+   const double mean = sum / (double)n;
+   const double variance = MathMax(0.0, (sum_sq / (double)n) - mean * mean);
+   const double std = MathSqrt(variance);
+   if(std <= 1e-12)
+      return 0.0;
+   return NormalizeSymmetric((current - mean) / std, 3.0);
+}
+
+double PullbackDepthATRAtShift(const int shift)
+{
+   const double atr = ATRAtShift(shift);
+   if(atr <= 0.0)
+      return 0.0;
+
+   const int hh_idx = iHighest(_Symbol, _Period, MODE_HIGH, InpHighestHighLookback, shift + 1);
+   if(hh_idx < 0)
+      return 0.0;
+   const double prior_high = iHigh(_Symbol, _Period, hh_idx);
+   return (prior_high - iClose(_Symbol, _Period, shift)) / atr;
+}
+
+int BarsSinceLastFreshHighAtShift(const datetime regime_start, const int shift)
+{
+   for(int i = shift; i < InpMaxScanBars; ++i)
+   {
+      const datetime bar_time = iTime(_Symbol, _Period, i);
+      if(bar_time == 0 || bar_time < regime_start)
+         break;
+      if(IsFresh100BarHighAtShift(i))
+         return i - shift;
+   }
+
+   const int start_shift = iBarShift(_Symbol, _Period, regime_start, false);
+   if(start_shift < shift)
+      return 0;
+   return MathMax(0, start_shift - shift);
+}
+
+double RegimePeakPriceAtShift(const datetime regime_start, const int shift)
+{
+   const int start_shift = iBarShift(_Symbol, _Period, regime_start, false);
+   if(start_shift < shift)
+      return iHigh(_Symbol, _Period, shift);
+
+   double peak = iHigh(_Symbol, _Period, shift);
+   for(int i = shift; i <= start_shift; ++i)
+   {
+      const double high = iHigh(_Symbol, _Period, i);
+      if(high > peak)
+         peak = high;
+   }
+   return peak;
+}
+
+double RegimePeakToCloseRetracementATRAtShift(const datetime regime_start, const int shift)
+{
+   const double atr = ATRAtShift(shift);
+   if(atr <= 0.0 || regime_start <= 0)
+      return 0.0;
+   const double peak = RegimePeakPriceAtShift(regime_start, shift);
+   return (peak - iClose(_Symbol, _Period, shift)) / atr;
+}
+
+double ZEma20ATRAtShift(const int shift)
+{
+   const double atr = ATRAtShift(shift);
+   const double ema_fast = EMAFastValueAtShift(shift);
+   if(atr <= 0.0)
+      return 0.0;
+   return (iClose(_Symbol, _Period, shift) - ema_fast) / atr;
+}
+
+double ZDecayFromPeakAtShift(const datetime regime_start, const int shift)
+{
+   if(regime_start <= 0)
+      return 0.0;
+
+   const int start_shift = iBarShift(_Symbol, _Period, regime_start, false);
+   if(start_shift < shift)
+      return 0.0;
+
+   double peak = -DBL_MAX;
+   for(int i = shift; i <= start_shift; ++i)
+   {
+      const double current_z = ZEma20ATRAtShift(i);
+      if(current_z > peak)
+         peak = current_z;
+   }
+   if(peak <= -DBL_MAX / 2.0)
+      return 0.0;
+   return peak - ZEma20ATRAtShift(shift);
+}
+
+double BollingerBandwidthChangeAtShift(const int shift, const int lookback)
+{
+   if(Bars(_Symbol, _Period) <= shift + lookback + 1)
+      return 0.0;
+
+   double sum_now = 0.0;
+   double sum_sq_now = 0.0;
+   double sum_prev = 0.0;
+   double sum_sq_prev = 0.0;
+   for(int i = shift; i < shift + lookback; ++i)
+   {
+      const double close_now = iClose(_Symbol, _Period, i);
+      const double close_prev = iClose(_Symbol, _Period, i + 1);
+      sum_now += close_now;
+      sum_sq_now += close_now * close_now;
+      sum_prev += close_prev;
+      sum_sq_prev += close_prev * close_prev;
+   }
+
+   const double mean_now = sum_now / (double)lookback;
+   const double mean_prev = sum_prev / (double)lookback;
+   const double std_now = MathSqrt(MathMax(0.0, (sum_sq_now / (double)lookback) - mean_now * mean_now));
+   const double std_prev = MathSqrt(MathMax(0.0, (sum_sq_prev / (double)lookback) - mean_prev * mean_prev));
+   return (4.0 * std_now) - (4.0 * std_prev);
+}
+
+bool FailedBreakoutFlagAtShift(const int shift)
+{
+   const double atr = ATRAtShift(shift);
+   if(atr <= 0.0)
+      return false;
+
+   const int hh_idx = iHighest(_Symbol, _Period, MODE_HIGH, InpHighestHighLookback, shift + 1);
+   if(hh_idx < 0)
+      return false;
+   const double prior_high = iHigh(_Symbol, _Period, hh_idx);
+   const double high = iHigh(_Symbol, _Period, shift);
+   const double close = iClose(_Symbol, _Period, shift);
+   return (high >= prior_high - atr * 0.25 && high <= prior_high + atr * 0.25 && close < prior_high);
+}
+
+double FailedBreakoutCountAtShift(const int shift, const int lookback)
+{
+   int count = 0;
+   for(int i = shift; i < shift + lookback && i < Bars(_Symbol, _Period) - 2; ++i)
+   {
+      if(FailedBreakoutFlagAtShift(i))
+         ++count;
+   }
+   return (double)count;
+}
+
+bool StalledCompressionFlagAtShift(const datetime regime_start, const int shift)
+{
+   const int lookback = MathMax(InpEfficiencyLookback, 5);
+   const double efficiency = RollingEfficiencyAtShift(shift, InpEfficiencyLookback);
+   const double bandwidth_change = BollingerBandwidthChangeAtShift(shift, lookback);
+   const int stale_bars = BarsSinceLastFreshHighAtShift(regime_start, shift);
+   return (efficiency < 0.25 && bandwidth_change <= 0.0 && stale_bars >= lookback / 2);
+}
+
+int ConsecutiveBarsWithoutNewHighSinceEntry(const datetime entry_time)
+{
+   const int entry_shift = iBarShift(_Symbol, _Period, entry_time, false);
+   if(entry_shift < 2)
+      return 0;
+
+   double highest = iHigh(_Symbol, _Period, entry_shift);
+   int bars_without = 0;
+   for(int shift = entry_shift - 1; shift >= 1; --shift)
+   {
+      const double high = iHigh(_Symbol, _Period, shift);
+      if(high > highest)
+      {
+         highest = high;
+         bars_without = 0;
+      }
+      else
+      {
+         ++bars_without;
+      }
+   }
+   return bars_without;
+}
+
+double ScoreContinuationQuality(const datetime regime_start, const int shift)
+{
+   const int lookback = MathMax(InpEfficiencyLookback, 5);
+   const double atr = ATRAtShift(shift);
+   const double fast_slope = (atr > 0.0 ? EMAFastSlopeAtShift(shift) / atr : 0.0);
+   const double mid_slope = (atr > 0.0 ? EMAMidSlopeAtShift(shift) / atr : 0.0);
+
+   double total = 0.0;
+   double total_weight = 0.0;
+
+   total += NormalizeWindow01ToSymmetric(RollingEfficiencyAtShift(shift, InpEfficiencyLookback), 0.0, 1.0) * 0.20;
+   total_weight += 0.20;
+   total += NormalizeWindow01ToSymmetric(TrendPersistenceAtShift(shift, 20), 0.0, 1.0) * 0.20;
+   total_weight += 0.20;
+   total += NormalizeSymmetric(fast_slope, 0.25) * 0.15;
+   total_weight += 0.15;
+   total += NormalizeSymmetric(mid_slope, 0.20) * 0.10;
+   total_weight += 0.10;
+   total += NormalizeWindow01ToSymmetric(FreshHighFrequencyAtShift(shift, lookback), 0.0, 1.0) * 0.15;
+   total_weight += 0.15;
+   total += NormalizeWindow01ToSymmetric(FractionClosesAboveEMAFastAtShift(shift, lookback), 0.0, 1.0) * 0.10;
+   total_weight += 0.10;
+   total += DistanceAboveEMA200ZAtShift(shift) * 0.10;
+   total_weight += 0.10;
+
+   if(total_weight <= 0.0)
+      return 0.0;
+   return ClampValue(total / total_weight, -1.0, 1.0);
+}
+
+double ScoreFragilityQuality(const datetime regime_start, const int shift)
+{
+   const int lookback = MathMax(InpEfficiencyLookback, 5);
+   double total = 0.0;
+   double total_weight = 0.0;
+
+   total += NormalizeWindow01ToSymmetric(PullbackDepthATRAtShift(shift), 0.0, 3.0) * 0.20;
+   total_weight += 0.20;
+   total += NormalizeWindow01ToSymmetric(RegimePeakToCloseRetracementATRAtShift(regime_start, shift), 0.0, 3.0) * 0.20;
+   total_weight += 0.20;
+   total += NormalizeWindow01ToSymmetric(ZDecayFromPeakAtShift(regime_start, shift), 0.0, 3.0) * 0.20;
+   total_weight += 0.20;
+   total += NormalizeWindow01ToSymmetric((double)BarsSinceLastFreshHighAtShift(regime_start, shift), 0.0, (double)lookback) * 0.15;
+   total_weight += 0.15;
+   total += NormalizeWindow01ToSymmetric(FailedBreakoutCountAtShift(shift, lookback), 0.0, 4.0) * 0.15;
+   total_weight += 0.15;
+   total += (StalledCompressionFlagAtShift(regime_start, shift) ? 1.0 : -1.0) * 0.10;
+   total_weight += 0.10;
+
+   if(total_weight <= 0.0)
+      return 0.0;
+   return ClampValue(total / total_weight, -1.0, 1.0);
+}
+
+void ComputeStateQualitySnapshot(const datetime regime_start, StateQualitySnapshot &snapshot)
+{
+   const int shift = 1;
+   snapshot.continuation_score = ScoreContinuationQuality(regime_start, shift);
+   snapshot.fragility_score = ScoreFragilityQuality(regime_start, shift);
+   snapshot.score = ClampValue(
+      snapshot.continuation_score - InpStateTwoScorePenaltyWeight * snapshot.fragility_score,
+      -1.0,
+      1.0
+   );
+
+   if(snapshot.score >= InpStateHighMinScore)
+      snapshot.tier = STATE_TIER_HIGH;
+   else if(snapshot.score >= InpStateMediumMinScore)
+      snapshot.tier = STATE_TIER_MEDIUM;
+   else
+      snapshot.tier = STATE_TIER_LOW;
+
+   if(snapshot.tier == STATE_TIER_HIGH)
+      snapshot.risk_multiplier = InpStateHighRiskMultiplier;
+   else if(snapshot.tier == STATE_TIER_MEDIUM)
+      snapshot.risk_multiplier = InpStateMediumRiskMultiplier;
+   else
+      snapshot.risk_multiplier = InpStateLowRiskMultiplier;
+}
+
+bool LowTierNoNewHighExitTriggered(const datetime entry_time, const double entry_price)
+{
+   const int bars_held = BarsInTrade(entry_time);
+   if(bars_held < InpLowNoNewHighMinBarsOpen)
+      return false;
+
+   const double highest_closed = HighestSinceEntryClosedBars(entry_time);
+   const double mfe_r = (highest_closed - entry_price) / InpStopDistancePrice;
+   if(mfe_r < InpLowNoNewHighMinMFER)
+      return false;
+
+   return (ConsecutiveBarsWithoutNewHighSinceEntry(entry_time) >= InpLowNoNewHighExitBars);
+}
+
+bool MediumTierRetracementExitTriggered(const datetime entry_time, const double entry_price)
+{
+   const int bars_held = BarsInTrade(entry_time);
+   if(bars_held < InpMediumRetraceMinBarsOpen)
+      return false;
+
+   const double highest_closed = HighestSinceEntryClosedBars(entry_time);
+   const double mfe = highest_closed - entry_price;
+   const double mfe_r = mfe / InpStopDistancePrice;
+   if(mfe <= 0.0 || mfe_r < InpMediumRetraceMinMFER)
+      return false;
+
+   const double current_gain = MathMax(iClose(_Symbol, _Period, 1) - entry_price, 0.0);
+   const double retracement_frac = (mfe - current_gain) / mfe;
+   return (retracement_frac >= InpMediumRetraceFrac);
+}
+
+double EMA20SlopeDecaySinceRegime(const datetime regime_start)
+{
+   if(regime_start <= 0)
+      return 0.0;
+
+   const int start_shift = iBarShift(_Symbol, _Period, regime_start, false);
+   if(start_shift < InpEMASlopeLookback + 1)
+      return 0.0;
+
+   double peak_slope = -1.0e100;
+   for(int shift = start_shift - 1; shift >= 1; --shift)
+   {
+      const double slope = EMAFastSlopeAtShift(shift);
+      if(slope > peak_slope)
+         peak_slope = slope;
+   }
+
+   if(peak_slope <= -1.0e99)
+      return 0.0;
+
+   const double current_slope = EMAFastSlopeAtShift(1);
+   return MathMax(0.0, peak_slope - current_slope);
+}
+
+bool BuildSurvivorStructureState(const datetime entry_time, const double entry_price, SurvivorStructureState &state)
+{
+   state.failed_high_attempts = 0;
+   state.lower_high_confirmed = false;
+   state.lower_low_confirmed = false;
+   state.lower_high_then_swing_low_break = false;
+   state.failed_breakout_flag = false;
+   state.last_confirmed_swing_low = 0.0;
+   state.last_confirmed_swing_high = 0.0;
+
+   const int lookback = MathMax(InpEfficiencyLookback, 5);
+   const int entry_shift = iBarShift(_Symbol, _Period, entry_time, false);
+   if(entry_shift < 4)
+      return false;
+
+   double previous_highest = iHigh(_Symbol, _Period, entry_shift);
+   bool failed_high_zone_active = false;
+   double prior_swing_high = 0.0;
+   bool has_prior_swing_high = false;
+   double prior_swing_low = 0.0;
+   bool has_prior_swing_low = false;
+   int lower_high_shift = -1;
+
+   for(int shift = entry_shift - 1; shift >= 1; --shift)
+   {
+      const double high = iHigh(_Symbol, _Period, shift);
+      const double low = iLow(_Symbol, _Period, shift);
+      const double close = iClose(_Symbol, _Period, shift);
+
+      if(previous_highest > entry_price)
+      {
+         const double retest_band = 0.25 * InpStopDistancePrice;
+         const double reset_band = 0.50 * InpStopDistancePrice;
+         const bool near_prior_high = high >= (previous_highest - retest_band);
+         const bool failed_retest = high <= previous_highest && near_prior_high;
+         if(failed_retest && !failed_high_zone_active)
+         {
+            ++state.failed_high_attempts;
+            failed_high_zone_active = true;
+         }
+         else if(high < (previous_highest - reset_band))
+         {
+            failed_high_zone_active = false;
+         }
+      }
+
+      if(high > previous_highest)
+      {
+         previous_highest = high;
+         failed_high_zone_active = false;
+      }
+
+      if(IsConfirmedSwingHighAtShift(shift))
+      {
+         const double swing_high = high;
+         if(has_prior_swing_high && swing_high < prior_swing_high)
+         {
+            state.lower_high_confirmed = true;
+            lower_high_shift = shift;
+         }
+         prior_swing_high = swing_high;
+         has_prior_swing_high = true;
+         state.last_confirmed_swing_high = swing_high;
+      }
+
+      if(IsConfirmedSwingLowAtShift(shift))
+      {
+         const double swing_low = low;
+         if(has_prior_swing_low && swing_low < prior_swing_low)
+            state.lower_low_confirmed = true;
+         prior_swing_low = swing_low;
+         has_prior_swing_low = true;
+         state.last_confirmed_swing_low = swing_low;
+      }
+
+      if(state.last_confirmed_swing_high > 0.0)
+      {
+         const double atr = ATRAtShift(shift);
+         const double band = atr * 0.25;
+         const bool near_high_zone = high >= (state.last_confirmed_swing_high - band);
+         if(near_high_zone && high <= (state.last_confirmed_swing_high + band) && close < state.last_confirmed_swing_high && shift == 1)
+            state.failed_breakout_flag = true;
+      }
+   }
+
+   if(lower_high_shift > 0 && state.last_confirmed_swing_low > 0.0)
+   {
+      const int bars_since_lower_high = lower_high_shift - 1;
+      if(bars_since_lower_high >= 0 && bars_since_lower_high <= lookback)
+      {
+         const double close1 = iClose(_Symbol, _Period, 1);
+         state.lower_high_then_swing_low_break = (close1 < state.last_confirmed_swing_low);
+      }
+   }
+
+   return true;
+}
+
+bool ContinuationSurvivorTightenShouldFire(
+   const datetime regime_start,
+   const datetime entry_time,
+   const double entry_price,
+   const double highest_since_entry
+)
+{
+   if(InpSurvivorFailedHighsThreshold <= 0 || InpSurvivorMinProfitR <= 0.0 || InpSurvivorTightenOffsetR <= 0.0)
+      return false;
+
+   const double mfe_r = (highest_since_entry - entry_price) / InpStopDistancePrice;
+   if(mfe_r < InpSurvivorMinProfitR)
+      return false;
+
+   SurvivorStructureState structure;
+   if(!BuildSurvivorStructureState(entry_time, entry_price, structure))
+      return false;
+   if(structure.failed_high_attempts < InpSurvivorFailedHighsThreshold)
+      return false;
+   if(InpSurvivorRequireLowerHighBreak && !structure.lower_high_then_swing_low_break)
+      return false;
+   if(InpSurvivorRequireFailedBreakout && !structure.failed_breakout_flag)
+      return false;
+   if(InpSurvivorMomentumRequireRegimeDead && !g_regime_continuation_dead)
+      return false;
+   if(EMA20SlopeDecaySinceRegime(regime_start) < InpSurvivorMinEMA20SlopeDecay)
+      return false;
+   return true;
+}
+
+void ResetRegimeControlState()
+{
+   g_state_regime_start = 0;
+   g_regime_continuation_dead = false;
+   g_regime_dead_reason = "";
+   g_regime_rearm_count = 0;
+   g_regime_last_rearm_bar = 0;
+   g_regime_last_rearm_reason = "";
+}
+
+void SyncRegimeControlState(const datetime regime_start, const RegimeStats &stats)
+{
+   if(regime_start <= 0)
+   {
+      ResetRegimeControlState();
+      return;
+   }
+
+   if(g_state_regime_start != regime_start)
+   {
+      ResetRegimeControlState();
+      g_state_regime_start = regime_start;
+   }
+
+   const double efficiency = RollingEfficiencyAtShift(1, InpEfficiencyLookback);
+   const int stale_bars = BarsSinceLastFreshHighInRegime(regime_start);
+
+   double ema_mid_vals[];
+   if(!CopyIndicatorBuffer(g_ema_mid_handle, 3, ema_mid_vals))
+      return;
+   const double ema50_1 = BufferValueAtShift(ema_mid_vals, 3, 1);
+   const double close1 = iClose(_Symbol, _Period, 1);
+
+   if(!g_regime_continuation_dead
+      && stats.entry_count > 0
+      && stats.failed_continuation_adds >= InpRegimeDeathFailedAddsThreshold
+      && stale_bars >= InpRegimeDeathNoFreshHighBars
+      && ema50_1 != EMPTY_VALUE
+      && close1 < ema50_1
+      && efficiency <= InpRegimeDeathMaxEfficiency)
+   {
+      g_regime_continuation_dead = true;
+      g_regime_dead_reason = "regime_death_suspend_continuation";
+      return;
+   }
+
+   if(g_regime_continuation_dead
+      && IsFresh100BarHighAtShift(1)
+      && efficiency >= InpRegimeRearmMinEfficiency)
+   {
+      g_regime_continuation_dead = false;
+      g_regime_dead_reason = "";
+      ++g_regime_rearm_count;
+      g_regime_last_rearm_bar = iTime(_Symbol, _Period, 1);
+      g_regime_last_rearm_reason = "regime_rearm_on_fresh_high_plus_efficiency_recovery";
+   }
+}
+
+double AdjustStopForBuy(const double proposed_sl)
+{
+   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   const double min_gap = StopLevelDistance();
+   double adjusted = proposed_sl;
+
+   if(adjusted >= bid - min_gap)
+      adjusted = bid - min_gap;
+
+   return NormalizePrice(adjusted);
+}
+
+bool ModifyPositionStops(const ulong ticket, const double new_sl, const double current_tp)
+{
+   if(ticket == 0)
+      return false;
+
+   const double sl = AdjustStopForBuy(new_sl);
+   if(sl <= 0.0)
+      return false;
+
+   if(!trade.PositionModify(ticket, sl, current_tp))
+      return false;
+
+   const uint retcode = trade.ResultRetcode();
+   return (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL || retcode == TRADE_RETCODE_PLACED);
+}
+
+bool ClosePosition(const ulong ticket)
+{
+   if(!trade.PositionClose(ticket, InpDeviationPoints))
+      return false;
+
+   const uint retcode = trade.ResultRetcode();
+   return (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL || retcode == TRADE_RETCODE_PLACED);
+}
+
+void RefreshRegimeState()
+{
+   datetime regime_start = 0;
+   if(!CurrentBullRegime(regime_start))
+   {
+      ResetRegimeControlState();
+      return;
+   }
+
+   RegimeStats stats;
+   if(!LoadRegimeStats(regime_start, stats))
+      return;
+
+   SyncRegimeControlState(regime_start, stats);
+}
+
+void ManageOpenPositions()
+{
+   const double one_r             = InpStopDistancePrice;
+   const double two_r             = InpBreakEvenTriggerR * one_r;
+   const double timed_trail       = InpTimedTrailR * one_r;
+   const double trend_trail       = InpTrendTrailAfter2RR * one_r;
+
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY)
+         continue;
+
+      const string comment       = PositionGetString(POSITION_COMMENT);
+      const TradeKind kind       = ParseTradeKind(comment);
+      const StateTier tier       = ParseStateTier(comment);
+      const datetime regime_start = ParseRegimeStart(comment);
+      const double entry         = PositionGetDouble(POSITION_PRICE_OPEN);
+      const double current_sl    = PositionGetDouble(POSITION_SL);
+      const double current_tp    = PositionGetDouble(POSITION_TP);
+      const datetime entry_time  = (datetime)PositionGetInteger(POSITION_TIME);
+      const int bars_held        = BarsInTrade(entry_time);
+      const double highest_closed = HighestSinceEntryClosedBars(entry_time);
+      const double mfe           = highest_closed - entry;
+
+      double target_sl = current_sl;
+      if(target_sl <= 0.0)
+         target_sl = entry - one_r;
+
+      if(kind == TRADE_FIRST)
+      {
+         if(tier == STATE_TIER_LOW && LowTierNoNewHighExitTriggered(entry_time, entry))
+         {
+            ClosePosition(ticket);
+            continue;
+         }
+
+         if(tier == STATE_TIER_MEDIUM && MediumTierRetracementExitTriggered(entry_time, entry))
+         {
+            ClosePosition(ticket);
+            continue;
+         }
+
+         if(mfe >= two_r)
+         {
+            if(entry > target_sl)
+               target_sl = entry;
+            const double trail_sl = highest_closed - trend_trail;
+            if(trail_sl > target_sl)
+               target_sl = trail_sl;
+         }
+         else if(bars_held >= InpTimedTrailActivationBars)
+         {
+            const double trail_sl = highest_closed - timed_trail;
+            if(trail_sl > target_sl)
+               target_sl = trail_sl;
+         }
+
+         if(target_sl > current_sl + SymbolInfoDouble(_Symbol, SYMBOL_POINT))
+            ModifyPositionStops(ticket, target_sl, current_tp);
+
+         if(BearishMacdDoublePeakSinceEntry(entry_time))
+            ClosePosition(ticket);
+      }
+      else if(kind == TRADE_CONT)
+      {
+         if(mfe >= two_r)
+         {
+            const double be_plus = entry + InpContinuationBreakEvenOffsetR * one_r;
+            if(be_plus > target_sl)
+               target_sl = be_plus;
+         }
+
+         if(ContinuationSurvivorTightenShouldFire(regime_start, entry_time, entry, highest_closed))
+         {
+            const double survivor_sl = highest_closed - InpSurvivorTightenOffsetR * one_r;
+            if(survivor_sl > target_sl)
+               target_sl = survivor_sl;
+         }
+
+         if(target_sl > current_sl + SymbolInfoDouble(_Symbol, SYMBOL_POINT))
+            ModifyPositionStops(ticket, target_sl, current_tp);
+      }
+   }
+}
+
+bool CanOpenAnotherTrade(const double new_trade_risk)
+{
+   if(StrategyPositionCount() >= InpMaxConcurrentTrades)
+      return false;
+
+   const double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   const double open_risk_limit = equity * InpMaxOpenRiskPercent / 100.0;
+   const double open_risk = OpenRiskMoney();
+   return (open_risk + new_trade_risk <= open_risk_limit + 1e-8);
+}
+
+bool OpenStrategyTrade(
+   const TradeKind kind,
+   const datetime regime_start,
+   const StateTier tier,
+   const double risk_multiplier
+)
+{
+   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(ask <= 0.0)
+      return false;
+
+   const double sl = NormalizePrice(ask - InpStopDistancePrice);
+   double tp = 0.0;
+   if(kind == TRADE_CONT)
+      tp = NormalizePrice(ask + InpContinuationTakeProfitR * InpStopDistancePrice);
+
+   const double risk_money = AccountInfoDouble(ACCOUNT_EQUITY)
+      * InpRiskPercentPerTrade
+      / 100.0
+      * MathMax(risk_multiplier, 0.0);
+   const double volume = CalculateVolume(risk_money, ask, sl);
+   if(volume <= 0.0)
+      return false;
+
+   const double actual_risk = LossForVolume(volume, ask, sl);
+   if(actual_risk <= 0.0)
+      return false;
+   if(!CanOpenAnotherTrade(actual_risk))
+      return false;
+
+   const string comment = KindTag(kind) + "|" + IntegerToString((long)regime_start) + "|" + TierName(tier);
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpDeviationPoints);
+
+   if(!trade.Buy(volume, _Symbol, 0.0, sl, tp, comment))
+      return false;
+
+   const uint retcode = trade.ResultRetcode();
+   return (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL || retcode == TRADE_RETCODE_PLACED);
+}
+
+void EvaluateEntry()
+{
+   datetime regime_start = 0;
+   if(!CurrentBullRegime(regime_start))
+   {
+      ResetRegimeControlState();
+      return;
+   }
+
+   RegimeStats stats;
+   if(!LoadRegimeStats(regime_start, stats))
+      return;
+
+   SyncRegimeControlState(regime_start, stats);
+
+   double reference_high = 0.0;
+   if(!EntrySignal(reference_high))
+      return;
+
+   StateQualitySnapshot state;
+   ComputeStateQualitySnapshot(regime_start, state);
+
+   const TradeKind kind = (stats.entry_count == 0 ? TRADE_FIRST : TRADE_CONT);
+   if(kind == TRADE_CONT)
+   {
+      if(g_regime_continuation_dead)
+         return;
+
+      const double entry_efficiency = RollingEfficiencyAtShift(1, InpEfficiencyLookback);
+      if(entry_efficiency < InpContinuationMinEfficiency)
+         return;
+
+      double candidate_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(candidate_price <= 0.0)
+         candidate_price = iClose(_Symbol, _Period, 1);
+      if(!ContinuationPassesRecentLossFilters(candidate_price))
+         return;
+   }
+
+   OpenStrategyTrade(kind, regime_start, state.tier, state.risk_multiplier);
 }
 
 int OnInit()
 {
-  trade.SetTypeFillingBySymbol(_Symbol);
+   if(!IsHedgingAccount())
+   {
+      Print("This EA requires a hedging account to support multiple concurrent trades.");
+      return INIT_FAILED;
+   }
 
-  hEmaSlow200 = iMA(_Symbol, _Period, InpA_SlowN, 0, MODE_EMA, PRICE_CLOSE);
-  hEmaMid50   = iMA(_Symbol, _Period, InpA_MidN, 0, MODE_EMA, PRICE_CLOSE);
-  hEmaFast20  = iMA(_Symbol, _Period, InpA_FastN, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema_handle = iMA(_Symbol, _Period, InpEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   if(g_ema_handle == INVALID_HANDLE)
+      return INIT_FAILED;
 
-  hEmaMid48   = iMA(_Symbol, _Period, InpC_MidN, 0, MODE_EMA, PRICE_CLOSE);
-  hEmaSlow144 = iMA(_Symbol, _Period, InpC_SlowN, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema_fast_handle = iMA(_Symbol, _Period, InpEMAFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   if(g_ema_fast_handle == INVALID_HANDLE)
+      return INIT_FAILED;
 
-  hATR        = iATR(_Symbol, _Period, InpATR_N);
+   g_ema_mid_handle = iMA(_Symbol, _Period, InpEMAMidPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   if(g_ema_mid_handle == INVALID_HANDLE)
+      return INIT_FAILED;
 
-  if(hEmaSlow200 == INVALID_HANDLE || hEmaMid48 == INVALID_HANDLE || hATR == INVALID_HANDLE)
-    return INIT_FAILED;
+   g_atr_handle = iATR(_Symbol, _Period, InpATRPeriod);
+   if(g_atr_handle == INVALID_HANDLE)
+      return INIT_FAILED;
 
-  g_lastBarTime = (datetime)iTime(_Symbol, _Period, 0);
-  g_peakEquity   = AccountInfoDouble(ACCOUNT_EQUITY);
-  g_anchorEquity = g_peakEquity;
-  return INIT_SUCCEEDED;
+   g_osma_handle = iOsMA(_Symbol, _Period, InpMacdFast, InpMacdSlow, InpMacdSignal, PRICE_CLOSE);
+   if(g_osma_handle == INVALID_HANDLE)
+      return INIT_FAILED;
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpDeviationPoints);
+   ResetRegimeControlState();
+   return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
-  if(hEmaSlow200 != INVALID_HANDLE) IndicatorRelease(hEmaSlow200);
-  if(hEmaMid50   != INVALID_HANDLE) IndicatorRelease(hEmaMid50);
-  if(hEmaFast20  != INVALID_HANDLE) IndicatorRelease(hEmaFast20);
-  if(hEmaMid48   != INVALID_HANDLE) IndicatorRelease(hEmaMid48);
-  if(hEmaSlow144 != INVALID_HANDLE) IndicatorRelease(hEmaSlow144);
-  if(hATR        != INVALID_HANDLE) IndicatorRelease(hATR);
-}
-
-void UpdateRegimeStatsOnClosedBar()
-{
-  // 1-bar raw return (close-close)
-  double c1 = iClose(_Symbol, _Period, 1);
-  double c2 = iClose(_Symbol, _Period, 2);
-  if(c1 <= 0.0 || c2 <= 0.0) return;
-
-  double r = (c1 / c2) - 1.0;
-
-  RollPush(g_r96Sum,  g_r96SumSq,  g_r96Buf,  g_r96Idx,  g_r96Count,  InpVolRegimeWindow, r);
-  RollPush(g_r384Sum, g_r384SumSq, g_r384Buf, g_r384Idx, g_r384Count, InpVolRegimeWindow*4, r);
-}
-
-void UpdateRetZStatsOnClosedBar()
-{
-  // A: cum horizon 2
-  {
-    int h = InpRetZ_CumHorizon_A;
-    double c0 = iClose(_Symbol, _Period, 1);
-    double cH = iClose(_Symbol, _Period, 1 + h);
-    if(c0 > 0.0 && cH > 0.0)
-    {
-      double cumRet = (c0 / cH) - 1.0;
-      RollPush(g_retSumA, g_retSumSqA, g_retBufA, g_retIdxA, g_retCountA, InpRetZ_Window, cumRet);
-    }
-  }
-  // C: cum horizon 3
-  {
-    int h = InpRetZ_CumHorizon_C;
-    double c0 = iClose(_Symbol, _Period, 1);
-    double cH = iClose(_Symbol, _Period, 1 + h);
-    if(c0 > 0.0 && cH > 0.0)
-    {
-      double cumRet = (c0 / cH) - 1.0;
-      RollPush(g_retSumC, g_retSumSqC, g_retBufC, g_retIdxC, g_retCountC, InpRetZ_Window, cumRet);
-    }
-  }
-}
-
-void UpdatePullVelStatsOnClosedBar()
-{
-  int dir; double vol;
-  if(!PositionIsOpen(dir, vol)) return;
-
-  if(!g_armed) return;
-
-  double c = iClose(_Symbol, _Period, 1);
-  double dd = (dir > 0) ? (g_bestFavorable - c) : (c - g_bestFavorable);
-  double denom = (double)MathMax(1, g_barsSinceNewMFE);
-  double vel = dd / denom;
-
-  RollPush(g_pvSum, g_pvSumSq, g_pvBuf, g_pvIdx, g_pvCount, (int)InpPullVelWindow, vel);
-}
-
-void EvaluateAndQueueEntry()
-{
-  int dir; double vol;
-  if(PositionIsOpen(dir, vol)) return; // netting-style: one position per symbol
-
-  if(InpRunMode == RUN_A || InpRunMode == RUN_B)
-  {
-    bool cond = Entry_A_or_B_Long();
-
-    bool prev = (InpRunMode == RUN_A) ? g_prevSigA : g_prevSigB;
-    bool edge = cond && !prev;
-
-    if(InpRunMode == RUN_A) g_prevSigA = cond;
-    else                    g_prevSigB = cond;
-
-    if(edge)
-    {
-      g_pendingDir = +1;
-      g_pending = true;
-      return;
-    }
-  }
-
-  if(InpRunMode == RUN_C)
-  {
-    int dirNow = 0;
-    bool condAny = Entry_C_LongShort(dirNow);
-
-    // edge per direction
-    bool long_cond  = (dirNow == +1);
-    bool short_cond = (dirNow == -1);
-
-    bool edge = false;
-    if(long_cond)
-    {
-      edge = long_cond && !g_prevSigC_L;
-      g_prevSigC_L = long_cond;
-      g_prevSigC_S = false;
-    }
-    else if(short_cond)
-    {
-      edge = short_cond && !g_prevSigC_S;
-      g_prevSigC_S = short_cond;
-      g_prevSigC_L = false;
-    }
-    else
-    {
-      g_prevSigC_L = false;
-      g_prevSigC_S = false;
-    }
-
-    if(condAny && edge)
-    {
-      g_pendingDir = dirNow;
-      g_pending = true;
-      return;
-    }
-  }
-}
-
-void EvaluateExitAndExecute()
-{
-  int dir; double vol;
-  if(!PositionIsOpen(dir, vol)) return;
-
-  // ensure SL exists
-  EnsurePositionStop(dir);
-
-  // update run-state was already updated on bar close
-  if(!g_armed) return;
-
-  // overlay_scope = runner_only_after_arm
-  // Apply gating + detector
-  bool doExit = false;
-
-  if(InpRunMode == RUN_A)
-  {
-    if(Gate_HVOL_STALL8())
-    {
-      double stdA = StdFromSums(g_retSumA, g_retSumSqA, g_retCountA);
-      doExit = ExitSignal_A_or_C(dir, InpRetZ_CumHorizon_A, InpRetZ_K, stdA);
-    }
-  }
-  else if(InpRunMode == RUN_B)
-  {
-    if(Gate_HVOL_STALL8())
-    {
-      double stdPV = StdFromSums(g_pvSum, g_pvSumSq, g_pvCount);
-      doExit = ExitSignal_B_PullVel(dir, InpPullVelK, stdPV);
-    }
-  }
-  else if(InpRunMode == RUN_C)
-  {
-    if(Gate_WHIP())
-    {
-      double stdC = StdFromSums(g_retSumC, g_retSumSqC, g_retCountC);
-      doExit = ExitSignal_A_or_C(dir, InpRetZ_CumHorizon_C, InpRetZ_K, stdC);
-    }
-  }
-
-  if(doExit)
-    ClosePosition();
-}
-
-void ExecutePendingIfAny()
-{
-  if(!g_pending) return;
-
-  // execute next bar open tick
-  OpenPosition(g_pendingDir);
-
-  g_pending = false;
-  g_pendingDir = 0;
-}
-
-void SyncRunStateFromPosition()
-{
-  int dir;
-  double vol;
-
-  if(!PositionIsOpen(dir, vol))
-  {
-    ResetRunState();
-    return;
-  }
-
-  if(g_entryPrice != 0.0)
-    return;
-
-  g_entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-
-  double sl = PositionGetDouble(POSITION_SL);
-  if(sl > 0.0)
-  {
-    g_Rdist = MathAbs(g_entryPrice - sl);
-  }
-  else
-  {
-    double atr = 0.0;
-    if(GetAtrForStop(atr))
-      g_Rdist = atr * InpStopATRMult;
-    else
-      g_Rdist = _Point * MathMax(1.0, InpMinStopPoints);
-
-    double minDist = _Point * InpMinStopPoints;
-    if(g_Rdist < minDist)
-      g_Rdist = minDist;
-  }
-
-  g_bestFavorable = g_entryPrice;
-  g_barsSinceNewMFE = 0;
-  g_armed = false;
-
-  ArrayResize(g_pvBuf, 0);
-  g_pvIdx = 0;
-  g_pvCount = 0;
-  g_pvSum = 0.0;
-  g_pvSumSq = 0.0;
-}
-
-bool InitRunStateFromLivePosition()
-{
-  int dir;
-  double vol;
-
-  if(!PositionIsOpen(dir, vol))
-    return false;
-
-  g_entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-
-  double sl = PositionGetDouble(POSITION_SL);
-  if(sl <= 0.0)
-    return false;
-
-  g_Rdist = MathAbs(g_entryPrice - sl);
-
-  double minDist = _Point * InpMinStopPoints;
-  if(g_Rdist < minDist)
-    g_Rdist = minDist;
-
-  g_bestFavorable = g_entryPrice;
-  g_barsSinceNewMFE = 0;
-  g_armed = false;
-
-  ArrayResize(g_pvBuf, 0);
-  g_pvIdx = 0;
-  g_pvCount = 0;
-  g_pvSum = 0.0;
-  g_pvSumSq = 0.0;
-
-  return true;
-}
-
-bool OpenPosition(int dir)
-{
-  double entry_price, stop_price, stop_dist_price;
-  if(!BuildOrderPrices(dir, entry_price, stop_price, stop_dist_price))
-    return false;
-
-  bool allowed = false;
-  double target_risk_dollars = 0.0;
-  double vol = ComputeVolumeByRiskProfile(stop_dist_price, allowed, target_risk_dollars);
-
-  if(!allowed || vol <= 0.0)
-  {
-    PrintFormat("ENTRY BLOCKED | profile=%d | targetRisk=%.2f | stopDist=%.5f",
-                (int)InpRiskProfile, target_risk_dollars, stop_dist_price);
-    return false;
-  }
-
-  trade.SetExpertMagicNumber(InpMagicBase + (ulong)InpRunMode);
-
-  bool ok = false;
-  if(dir > 0)
-    ok = trade.Buy(vol, _Symbol, 0.0, stop_price, 0.0);
-  else
-    ok = trade.Sell(vol, _Symbol, 0.0, stop_price, 0.0);
-
-  if(!ok)
-  {
-    PrintFormat("ORDER FAILED | dir=%d | vol=%.2f | sl=%.5f | err=%d",
-                dir, vol, stop_price, GetLastError());
-    return false;
-  }
-
-  g_entryPrice = 0.0;
-  SyncRunStateFromPosition();
-
-  PrintFormat("ENTRY OK | profile=%d | dir=%d | vol=%.2f | targetRisk=%.2f | stopDist=%.5f | DD=%.2f%% | openRisk=%.2f",
-              (int)InpRiskProfile,
-              dir,
-              vol,
-              target_risk_dollars,
-              stop_dist_price,
-              100.0 * CurrentDrawdownFrac(),
-              CurrentOpenRiskDollars());
-
-  return true;
-}
-
-void EvaluateEntriesAndExecuteNow()
-{
-  int dir;
-  double vol;
-
-  if(PositionIsOpen(dir, vol))
-    return;
-
-  if(InpRunMode == RUN_A || InpRunMode == RUN_B)
-  {
-    bool cond = Entry_A_or_B_Long();
-    bool prev = (InpRunMode == RUN_A) ? g_prevSigA : g_prevSigB;
-    bool edge = cond && !prev;
-
-    if(InpRunMode == RUN_A)
-      g_prevSigA = cond;
-    else
-      g_prevSigB = cond;
-
-    if(edge)
-      OpenPosition(+1);
-
-    return;
-  }
-
-  if(InpRunMode == RUN_C)
-  {
-    int dirNow = 0;
-    bool condAny = Entry_C_LongShort(dirNow);
-
-    bool long_cond  = (condAny && dirNow == +1);
-    bool short_cond = (condAny && dirNow == -1);
-
-    bool edge = false;
-
-    if(long_cond)
-    {
-      edge = !g_prevSigC_L;
-      g_prevSigC_L = true;
-      g_prevSigC_S = false;
-    }
-    else if(short_cond)
-    {
-      edge = !g_prevSigC_S;
-      g_prevSigC_S = true;
-      g_prevSigC_L = false;
-    }
-    else
-    {
-      g_prevSigC_L = false;
-      g_prevSigC_S = false;
-    }
-
-    if(edge)
-      OpenPosition(dirNow);
-  }
+   if(g_ema_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_handle);
+   if(g_ema_fast_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_fast_handle);
+   if(g_ema_mid_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_mid_handle);
+   if(g_atr_handle != INVALID_HANDLE)
+      IndicatorRelease(g_atr_handle);
+   if(g_osma_handle != INVALID_HANDLE)
+      IndicatorRelease(g_osma_handle);
 }
 
 void OnTick()
 {
-  UpdatePeakEquity();
+   if(!IsNewBar())
+      return;
 
-  if(!IsNewBar()) return;
-
-  SyncRunStateFromPosition();
-
-  AtrAndRegimeUpdateOnClosedBar(InpATR_N, InpVolRegimeWindow, InpWhipsawWindow);
-  UpdateEWMAResidualOnClosedBar();
-  UpdateRetZStatsOnClosedBar();
-  UpdateMFEStateOnClosedBar();
-  UpdatePullVelStatsOnClosedBar();
-
-  EvaluateExitAndExecute();
-  ExecutePendingIfAny();
-  EvaluateAndQueueEntry();
+   RefreshRegimeState();
+   ManageOpenPositions();
+   EvaluateEntry();
 }
-
